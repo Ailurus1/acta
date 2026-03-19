@@ -48,13 +48,15 @@ def _channel_stats(values: torch.Tensor) -> dict[str, list[float]]:
     }
 
 
-def _prepare_channel_first(x: torch.Tensor) -> torch.Tensor:
+def _prepare_per_channel(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
     """
     Convert tensor to shape [N, C] where C is channel/features dimension.
 
     1D: single channel
     2D: treat last dim as channels (e.g., [batch, hidden])
-    >=3D: treat dim=1 as channels (e.g., conv outputs [N, C, ...])
+    >=3D:
+      - conv-like modules: treat dim=1 as channels ([N, C, ...])
+      - other modules (e.g., transformer blocks): treat last dim as channels
     """
     x = x.detach().float()
     if x.ndim == 0:
@@ -64,7 +66,19 @@ def _prepare_channel_first(x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 2:
         return x.reshape(-1, x.shape[-1])
 
-    x = x.movedim(1, -1)
+    is_conv_like = isinstance(
+        module,
+        (
+            nn.Conv1d,
+            nn.Conv2d,
+            nn.Conv3d,
+            nn.ConvTranspose1d,
+            nn.ConvTranspose2d,
+            nn.ConvTranspose3d,
+        ),
+    )
+    if is_conv_like:
+        x = x.movedim(1, -1)
     return x.reshape(-1, x.shape[-1])
 
 
@@ -98,12 +112,12 @@ class _AnalyzerModel(nn.Module):
                 if not tensor.is_floating_point():
                     return
 
-                flattened = _prepare_channel_first(tensor)
+                flattened = _prepare_per_channel(tensor, mod)
                 self._layer_values.setdefault(layer_name, []).append(flattened.cpu())
 
             self._hooks.append(module.register_forward_hook(_hook_fn))
 
-    def _clear_buffers(self) -> None:
+    def reset_stats(self) -> None:
         self._layer_values.clear()
 
     def _build_stats(self) -> dict[str, Any]:
@@ -112,7 +126,9 @@ class _AnalyzerModel(nn.Module):
             if not chunks:
                 continue
             data = torch.cat(chunks, dim=0)
-            layers[layer_name] = _channel_stats(data)
+            layer_stats = _channel_stats(data)
+            layer_stats["num_observations"] = data.shape[0]
+            layers[layer_name] = layer_stats
         return {"layers": layers}
 
     def _dump_stats(self) -> None:
@@ -121,7 +137,6 @@ class _AnalyzerModel(nn.Module):
             json.dump(stats, f, indent=2)
 
     def _run_and_dump(self, runner: Any, *args: Any, **kwargs: Any) -> Any:
-        self._clear_buffers()
         result = runner(*args, **kwargs)
         self._dump_stats()
         return result
