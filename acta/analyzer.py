@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import fnmatch
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+
+from .visualizer import draw_activation_charts
 
 
 def _to_tensor(output: Any) -> torch.Tensor | None:
@@ -83,10 +88,18 @@ def _prepare_per_channel(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
 
 
 class _AnalyzerModel(nn.Module):
-    def __init__(self, model: nn.Module, dump_stats_path: str) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        dump_stats_path: str,
+        target_layers: str | list[str] | None = None,
+        draw_charts: bool = False,
+    ) -> None:
         super().__init__()
         self.model = model
         self.dump_stats_path = dump_stats_path
+        self.target_layers = target_layers
+        self.draw_charts = draw_charts
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._layer_values: dict[str, list[torch.Tensor]] = {}
         self._register_hooks()
@@ -97,13 +110,38 @@ class _AnalyzerModel(nn.Module):
             return getattr(self.model, "device")
         return next(self.model.parameters()).device
 
+    def _layer_is_targeted(self, layer_name: str, module: nn.Module) -> bool:
+        if self.target_layers is None:
+            return True
+
+        patterns = self.target_layers if isinstance(self.target_layers, list) else [self.target_layers]
+        class_name = module.__class__.__name__
+        for pattern in patterns:
+            # Support shell-style wildcard filters like "*_proj".
+            if fnmatch.fnmatchcase(layer_name, pattern) or fnmatch.fnmatchcase(class_name, pattern):
+                return True
+
+            # Also support raw regular expressions.
+            try:
+                if re.search(pattern, layer_name) or re.search(pattern, class_name):
+                    return True
+            except re.error:
+                continue
+
+        return False
+
     def _register_hooks(self) -> None:
         for name, module in self.model.named_modules():
             if name == "":
                 continue
 
-            if any(True for _ in module.children()):
-                continue
+            is_leaf = not any(True for _ in module.children())
+            if self.target_layers is None:
+                if not is_leaf:
+                    continue
+            else:
+                if not self._layer_is_targeted(name, module):
+                    continue
 
             def _hook_fn(mod: nn.Module, inputs: tuple[Any, ...], output: Any, layer_name: str = name) -> None:
                 tensor = _to_tensor(output)
@@ -135,6 +173,9 @@ class _AnalyzerModel(nn.Module):
         stats = self._build_stats()
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
+        if self.draw_charts:
+            chart_dir = Path(self.dump_stats_path).with_suffix("")
+            draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
 
     def _run_and_dump(self, runner: Any, *args: Any, **kwargs: Any) -> Any:
         result = runner(*args, **kwargs)
@@ -156,5 +197,15 @@ class _AnalyzerModel(nn.Module):
             return getattr(self.model, item)
 
 
-def AutoAnalyzer(model: nn.Module, dump_stats_path: str = "./activations_analysis.json") -> nn.Module:
-    return _AnalyzerModel(model=model, dump_stats_path=dump_stats_path)
+def AutoAnalyzer(
+    model: nn.Module,
+    dump_stats_path: str = "./activations_analysis.json",
+    target_layers: str | list[str] | None = None,
+    draw_charts: bool = False,
+) -> nn.Module:
+    return _AnalyzerModel(
+        model=model,
+        dump_stats_path=dump_stats_path,
+        target_layers=target_layers,
+        draw_charts=draw_charts,
+    )
