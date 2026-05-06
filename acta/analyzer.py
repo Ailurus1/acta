@@ -146,7 +146,6 @@ def _format_outlier_table_decoded(
 
 def decode_token(tokenizer: Any, token_id: int) -> str:
     if tokenizer is None:
-        print(f"Tokenizer is None")
         return str(token_id)
     if hasattr(tokenizer, "decode"):
         try:
@@ -179,6 +178,7 @@ class _AnalyzerModel(nn.Module):
         hard_seqdim_frac: float = 0.06,
         verbose: bool = False,
         tokenizer: Any | None = None,
+        vit_reg_patch_labels: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -191,6 +191,7 @@ class _AnalyzerModel(nn.Module):
         self.hard_seqdim_frac = float(hard_seqdim_frac)
         self.verbose = bool(verbose)
         self.tokenizer = tokenizer
+        self.vit_reg_patch_labels = bool(vit_reg_patch_labels)
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._layer_values: dict[str, list[torch.Tensor]] = {}
         self._in_generate: bool = False
@@ -210,6 +211,43 @@ class _AnalyzerModel(nn.Module):
         self._run_token_maxabs_by_layer: dict[str, list[torch.Tensor]] = {}
         self._last_generate_outliers: dict[str, Any] | None = None
         self._register_hooks()
+
+    def _reset_run_sequence_buffers(self) -> None:
+        self._run_token_frac_by_layer.clear()
+        self._run_token_mean_by_layer.clear()
+        self._run_token_var_by_layer.clear()
+        self._last_generate_outliers = None
+        self._last_prompt_token_ids = None
+        self._prompt_len = None
+        self._run_feature_token_count_by_layer.clear()
+        self._run_feature_counts_by_layer.clear()
+        self._run_max_abs_token_feature_by_layer.clear()
+        self._run_max_abs_token_feature = None
+        self._run_hidden_dim = None
+        self._run_argmax_layer_per_token_feature = None
+        self._run_layer_order.clear()
+        self._run_layer_to_index.clear()
+        self._run_token_maxabs_by_layer.clear()
+
+    def _maybe_set_prompt_len_from_tensor(self, tensor: torch.Tensor) -> None:
+        if self._prompt_len is None and tensor.ndim == 3:
+            # Works for LLMs and ViTs: treat dim=1 as sequence length.
+            self._prompt_len = int(tensor.shape[1])
+
+    def _default_position_tokens(self, n: int) -> list[str]:
+        if n <= 0:
+            return []
+        if n == 1:
+            return ["cls"]
+        return ["cls"] + [f"pos_{i}" for i in range(1, n)]
+
+    def _sequence_position_labels(self, n: int) -> list[str]:
+        """Labels for sequence positions when tokenizer is None (e.g. ViT patches)."""
+        if n <= 0:
+            return []
+        if self.vit_reg_patch_labels:
+            return [f"reg_{i}" for i in range(n)]
+        return self._default_position_tokens(n)
 
     @property
     def device(self) -> torch.device:
@@ -256,6 +294,7 @@ class _AnalyzerModel(nn.Module):
                     return
 
                 if self._in_generate:
+                    self._maybe_set_prompt_len_from_tensor(tensor)
                     frac = _token_outlier_fraction(tensor, threshold=self.outlier_threshold)
                     if frac is not None:
                         self._run_token_frac_by_layer.setdefault(layer_name, []).append(frac.cpu())
@@ -349,27 +388,57 @@ class _AnalyzerModel(nn.Module):
         return result
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self._run_and_dump(self.model.forward, *args, **kwargs)
+        self._reset_run_sequence_buffers()
+        self._in_generate = True
+        try:
+            result = self.model.forward(*args, **kwargs)
+        finally:
+            self._in_generate = False
+
+        # Build a pseudo "outliers" payload based on collected sequence stats, if any.
+        if self._prompt_len is not None:
+            use_len = int(self._prompt_len)
+            token_ids = list(range(use_len))
+            decoded = (
+                self._sequence_position_labels(use_len)
+                if self.tokenizer is None
+                else [decode_token(self.tokenizer, i) for i in token_ids]
+            )
+            fake = torch.tensor([token_ids], dtype=torch.long)
+            self._last_generate_outliers = self._detect_outliers_after_generate(fake, prompt_len=use_len)
+            if self._last_generate_outliers is not None:
+                self._last_generate_outliers["prompt_token_ids"] = token_ids
+                self._last_generate_outliers["prompt_tokens"] = decoded
+                if "token_trends" in self._last_generate_outliers and isinstance(self._last_generate_outliers["token_trends"], dict):
+                    self._last_generate_outliers["token_trends"]["tokens"] = decoded
+                    self._last_generate_outliers["token_trends"]["token_ids"] = token_ids
+                if "soft_definition" in self._last_generate_outliers and "hard_definition" in self._last_generate_outliers:
+                    soft = self._last_generate_outliers.get("soft_definition", [])
+                    hard = self._last_generate_outliers.get("hard_definition", [])
+                    layers = self._last_generate_outliers.get("per_token_layer", [None] * len(decoded))
+                    dims = self._last_generate_outliers.get("per_token_channel_dim", [None] * len(decoded))
+                    self._last_generate_outliers["table"] = _format_outlier_table_decoded(
+                        tokens=decoded,
+                        token_ids=token_ids,
+                        soft=soft,
+                        hard=hard,
+                        layers=layers,
+                        channel_dims=dims,
+                    )
+
+            if self.verbose and self._last_generate_outliers is not None:
+                table = self._last_generate_outliers.get("table")
+                if table:
+                    print(table)
+
+        self._dump_stats()
+        return result
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
         if not hasattr(self.model, "generate"):
             raise AttributeError("Wrapped model has no 'generate' method")
+        self._reset_run_sequence_buffers()
         self._in_generate = True
-        self._run_token_frac_by_layer.clear()
-        self._run_token_mean_by_layer.clear()
-        self._run_token_var_by_layer.clear()
-        self._last_generate_outliers = None
-        self._last_prompt_token_ids = None
-        self._prompt_len = None
-        self._run_feature_token_count_by_layer.clear()
-        self._run_feature_counts_by_layer.clear()
-        self._run_max_abs_token_feature_by_layer.clear()
-        self._run_max_abs_token_feature = None
-        self._run_hidden_dim = None
-        self._run_argmax_layer_per_token_feature = None
-        self._run_layer_order.clear()
-        self._run_layer_to_index.clear()
-        self._run_token_maxabs_by_layer.clear()
 
         prompt_len: int | None = None
         input_ids = kwargs.get("input_ids", None)
@@ -461,18 +530,26 @@ class _AnalyzerModel(nn.Module):
 
         # Feature-dimension outlier detection (LLM.int8-style) and 3D plot payload.
         outlier_feature_dims: list[int] = []
+        h_shared: int | None = None
         if self._run_feature_counts_by_layer and self._run_feature_token_count_by_layer:
             eligible_layers = [ln for ln in layer_names if ln in self._run_feature_counts_by_layer]
             if eligible_layers:
-                h = int(self._run_feature_counts_by_layer[eligible_layers[0]].shape[0])
+                # Only compare layers that share the same feature dimension H.
+                lengths = [int(self._run_feature_counts_by_layer[ln].shape[0]) for ln in eligible_layers]
+                h = int(max(set(lengths), key=lengths.count))
+                eligible_layers = [ln for ln in eligible_layers if int(self._run_feature_counts_by_layer[ln].shape[0]) == h]
+                h_shared = h
                 affected_layers_per_dim = torch.zeros(h, dtype=torch.float32)
                 num_layers = len(eligible_layers)
-                for ln in eligible_layers:
-                    total_toks = max(int(self._run_feature_token_count_by_layer.get(ln, 0)), 1)
-                    frac_tokens = self._run_feature_counts_by_layer[ln].to(torch.float32) / float(total_toks)
-                    affected_layers_per_dim += (frac_tokens >= float(self.hard_seqdim_frac)).to(torch.float32)
-                frac_layers = affected_layers_per_dim / float(num_layers)
-                outlier_feature_dims = (frac_layers >= float(self.hard_layers_frac)).nonzero(as_tuple=False).view(-1).cpu().tolist()
+                if num_layers > 0:
+                    for ln in eligible_layers:
+                        total_toks = max(int(self._run_feature_token_count_by_layer.get(ln, 0)), 1)
+                        frac_tokens = self._run_feature_counts_by_layer[ln].to(torch.float32) / float(total_toks)
+                        affected_layers_per_dim += (frac_tokens >= float(self.hard_seqdim_frac)).to(torch.float32)
+                    frac_layers = affected_layers_per_dim / float(num_layers)
+                    outlier_feature_dims = (
+                        (frac_layers >= float(self.hard_layers_frac)).nonzero(as_tuple=False).view(-1).cpu().tolist()
+                    )
 
         token_feature_magnitude: list[list[float]] | None = None
         if self._run_max_abs_token_feature is not None and outlier_feature_dims:
@@ -480,9 +557,14 @@ class _AnalyzerModel(nn.Module):
             token_feature_magnitude = max_abs[:, outlier_feature_dims].cpu().tolist()  # [T][F]
 
         token_feature_magnitude_by_layer: dict[str, list[list[float]]] = {}
-        if outlier_feature_dims and self._run_max_abs_token_feature_by_layer:
+        h_for_slices = h_shared
+        if h_for_slices is None and self._run_max_abs_token_feature is not None:
+            h_for_slices = int(self._run_max_abs_token_feature.shape[1])
+        if outlier_feature_dims and self._run_max_abs_token_feature_by_layer and h_for_slices is not None:
             for ln, ten in self._run_max_abs_token_feature_by_layer.items():
                 if ten.ndim != 2:
+                    continue
+                if int(ten.shape[1]) != int(h_for_slices):
                     continue
                 t_use = min(int(use_len), int(ten.shape[0]))
                 if t_use <= 0:
@@ -570,6 +652,7 @@ def AutoAnalyzer(
     hard_seqdim_frac: float = 0.06,
     verbose: bool = False,
     tokenizer: Any | None = None,
+    vit_reg_patch_labels: bool = True,
 ) -> nn.Module:
     return _AnalyzerModel(
         model=model,
@@ -582,4 +665,5 @@ def AutoAnalyzer(
         hard_seqdim_frac=hard_seqdim_frac,
         verbose=verbose,
         tokenizer=tokenizer,
+        vit_reg_patch_labels=vit_reg_patch_labels,
     )
