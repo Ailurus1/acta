@@ -17,8 +17,14 @@ def main() -> None:
         verbose=True,
     )
 
-    inputs = tokenizer("Summer is warm. Winter is cold.", return_tensors="pt").to(model.device)
-    outputs = model.generate(**inputs, max_new_tokens=100)
+    prompts = [
+        "Hey there!"
+        "Once upon a time in a land far, far away...",
+        "Never gonna give you up",
+        "Never gonna let you down"
+    ]
+    inputs = [tokenizer(prompt, return_tensors="pt").to(model.device) for prompt in prompts]
+    outputs = [model.generate(**input, max_new_tokens=100) for input in inputs]
 
 if __name__ == "__main__":
     main()

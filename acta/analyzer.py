@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import copy
 import csv
 import fnmatch
 import json
@@ -205,7 +207,10 @@ class _AnalyzerModel(nn.Module):
         self._run_layer_to_index: dict[str, int] = {}
         self._run_token_maxabs_by_layer: dict[str, list[torch.Tensor]] = {}
         self._last_generate_outliers: dict[str, Any] | None = None
+        self._aggregate_generate_outliers: dict[str, Any] | None = None
+        self._final_dump_done: bool = False
         self._register_hooks()
+        atexit.register(self._finalize_on_exit)
 
     def _resolve_versioned_dump_paths(self) -> tuple[Path, Path, str]:
         """
@@ -241,12 +246,12 @@ class _AnalyzerModel(nn.Module):
         path = self.output_run_dir / "acta_results.csv"
         fieldnames = ["idx", "token", "token_id", "layer", "channel_dim", "outliers"]
         rows: list[dict[str, Any]] = []
-        if self._last_generate_outliers is not None:
-            tokens = self._last_generate_outliers.get("prompt_tokens", [])
-            tids = self._last_generate_outliers.get("prompt_token_ids", [])
-            outlier_flags = self._last_generate_outliers.get("outliers", [])
-            layers = self._last_generate_outliers.get("per_token_layer", [])
-            dims = self._last_generate_outliers.get("per_token_channel_dim", [])
+        if self._aggregate_generate_outliers is not None:
+            tokens = self._aggregate_generate_outliers.get("prompt_tokens", [])
+            tids = self._aggregate_generate_outliers.get("prompt_token_ids", [])
+            outlier_flags = self._aggregate_generate_outliers.get("outliers", [])
+            layers = self._aggregate_generate_outliers.get("per_token_layer", [])
+            dims = self._aggregate_generate_outliers.get("per_token_channel_dim", [])
             for i, tok in enumerate(tokens):
                 rows.append(
                     {
@@ -426,11 +431,62 @@ class _AnalyzerModel(nn.Module):
             layers[layer_name] = layer_stats
         return {"layers": layers}
 
-    def _dump_stats(self) -> None:
+    def _finalize_on_exit(self) -> None:
+        if self._final_dump_done:
+            return
+        self._dump_stats(draw_charts=self.draw_charts)
+
+    def _merge_outliers_across_calls(self, run_outliers: dict[str, Any] | None) -> None:
+        if run_outliers is None:
+            return
+        if self._aggregate_generate_outliers is None:
+            self._aggregate_generate_outliers = copy.deepcopy(run_outliers)
+            return
+
+        agg = self._aggregate_generate_outliers
+        run_flags = [bool(v) for v in run_outliers.get("outliers", [])]
+        agg_flags = [bool(v) for v in agg.get("outliers", [])]
+        n = max(len(agg_flags), len(run_flags))
+
+        def _pad(values: list[Any], fill: Any, size: int) -> list[Any]:
+            out = list(values)
+            if len(out) < size:
+                out.extend([fill] * (size - len(out)))
+            return out
+
+        agg_flags = _pad(agg_flags, False, n)
+        run_flags = _pad(run_flags, False, n)
+        merged_flags = [a or b for a, b in zip(agg_flags, run_flags, strict=False)]
+        agg["outliers"] = merged_flags
+        agg["token_count"] = int(max(int(agg.get("token_count", 0)), int(run_outliers.get("token_count", 0))))
+
+        for key, fill in (("prompt_tokens", ""), ("prompt_token_ids", ""), ("per_token_layer", None), ("per_token_channel_dim", None)):
+            agg_vals = _pad(list(agg.get(key, [])), fill, n)
+            run_vals = _pad(list(run_outliers.get(key, [])), fill, n)
+            merged_vals: list[Any] = []
+            for i in range(n):
+                if agg_vals[i] not in (None, ""):
+                    merged_vals.append(agg_vals[i])
+                else:
+                    merged_vals.append(run_vals[i])
+            agg[key] = merged_vals
+
+        agg["table"] = _format_outlier_table_decoded(
+            tokens=[str(v) for v in agg.get("prompt_tokens", [])],
+            token_ids=[
+                int(v) if isinstance(v, int) else int(i)
+                for i, v in enumerate(agg.get("prompt_token_ids", []))
+            ],
+            outliers=[bool(v) for v in agg.get("outliers", [])],
+            layers=list(agg.get("per_token_layer", [])),
+            channel_dims=list(agg.get("per_token_channel_dim", [])),
+        )
+
+    def _dump_stats(self, draw_charts: bool = False) -> None:
         stats = self._build_stats()
-        if self._last_generate_outliers is not None:
-            self._last_generate_outliers["chart_3d_max_tokens"] = self.chart_3d_max_tokens
-            stats["outliers"] = self._last_generate_outliers
+        if self._aggregate_generate_outliers is not None:
+            self._aggregate_generate_outliers["chart_3d_max_tokens"] = self.chart_3d_max_tokens
+            stats["outliers"] = self._aggregate_generate_outliers
         stats["_acta"] = {
             "dump_stats_root": self.dump_stats_root.as_posix(),
             "output_run_dir": self.output_run_dir.as_posix(),
@@ -441,13 +497,14 @@ class _AnalyzerModel(nn.Module):
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
         self._write_acta_results_csv()
-        if self.draw_charts:
+        if draw_charts:
             chart_dir = Path(self.dump_stats_path).parent
             draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
+        self._final_dump_done = bool(draw_charts)
 
     def _run_and_dump(self, runner: Any, *args: Any, **kwargs: Any) -> Any:
         result = runner(*args, **kwargs)
-        self._dump_stats()
+        self._dump_stats(draw_charts=False)
         return result
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -487,12 +544,12 @@ class _AnalyzerModel(nn.Module):
                         channel_dims=dims,
                     )
 
-            if self.verbose and self._last_generate_outliers is not None:
-                table = self._last_generate_outliers.get("table")
-                if table:
-                    print(table)
-
-        self._dump_stats()
+        self._merge_outliers_across_calls(self._last_generate_outliers)
+        if self.verbose and self._aggregate_generate_outliers is not None:
+            table = self._aggregate_generate_outliers.get("table")
+            if table:
+                print(table)
+        self._dump_stats(draw_charts=False)
         return result
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
@@ -515,11 +572,12 @@ class _AnalyzerModel(nn.Module):
             self._last_prompt_token_ids = result[0, :prompt_len].detach().cpu().tolist()
 
         self._last_generate_outliers = self._detect_outliers_after_generate(result, prompt_len=prompt_len)
-        if self.verbose and self._last_generate_outliers is not None:
-            table = self._last_generate_outliers.get("table")
+        self._merge_outliers_across_calls(self._last_generate_outliers)
+        if self.verbose and self._aggregate_generate_outliers is not None:
+            table = self._aggregate_generate_outliers.get("table")
             if table:
                 print(table)
-        self._dump_stats()
+        self._dump_stats(draw_charts=False)
         return result
 
     def _detect_outliers_after_generate(self, generate_result: Any, prompt_len: int | None) -> dict[str, Any] | None:
@@ -543,7 +601,6 @@ class _AnalyzerModel(nn.Module):
         t_min = min(t.shape[1] for t in per_layer_frac.values())
         frac_stack = torch.stack([per_layer_frac[name][:, :t_min] for name in layer_names], dim=0)  # [L, B, T]
 
-        # Hard (LLM.int8-style): >=25% layers have >=seqdim_fraction hidden dims exceeding threshold.
         layer_affected = frac_stack >= self.hard_seqdim_frac  # [L, B, T]
         frac_layers_affected = layer_affected.to(torch.float32).mean(dim=0)  # [B, T]
         hard_mask = frac_layers_affected >= self.hard_layers_frac
@@ -583,7 +640,6 @@ class _AnalyzerModel(nn.Module):
                 "token_ids": token_ids,
             }
 
-        # Feature-dimension outlier detection (LLM.int8-style) and 3D plot payload.
         outlier_feature_dims: list[int] = []
         h_shared: int | None = None
         if self._run_feature_counts_by_layer and self._run_feature_token_count_by_layer:
