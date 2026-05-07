@@ -16,7 +16,7 @@ from torch import nn
 
 from .visualizer import draw_activation_charts
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("acta.analyzer")
 
 
 def _to_tensor(output: Any) -> torch.Tensor | None:
@@ -188,6 +188,11 @@ class _AnalyzerModel(nn.Module):
         self.hard_layers_frac = float(hard_layers_frac)
         self.hard_seqdim_frac = float(hard_seqdim_frac)
         self.verbose = bool(verbose)
+        if self.verbose and not logging.getLogger("acta").handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+            )
         self.tokenizer = tokenizer
         self.vit_reg_patch_labels = bool(vit_reg_patch_labels)
         self.asr_chunk_labels = bool(asr_chunk_labels)
@@ -556,10 +561,6 @@ class _AnalyzerModel(nn.Module):
                     )
 
         self._merge_outliers_across_calls(self._last_generate_outliers)
-        if self.verbose and self._aggregate_generate_outliers is not None:
-            table = self._aggregate_generate_outliers.get("table")
-            if table:
-                logger.info("\n%s", table)
         self._dump_stats(draw_charts=False)
         return result
 
@@ -584,10 +585,6 @@ class _AnalyzerModel(nn.Module):
 
         self._last_generate_outliers = self._detect_outliers_after_generate(result, prompt_len=prompt_len)
         self._merge_outliers_across_calls(self._last_generate_outliers)
-        if self.verbose and self._aggregate_generate_outliers is not None:
-            table = self._aggregate_generate_outliers.get("table")
-            if table:
-                logger.info("\n%s", table)
         self._dump_stats(draw_charts=False)
         return result
 
