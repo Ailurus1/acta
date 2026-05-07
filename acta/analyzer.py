@@ -5,6 +5,7 @@ import copy
 import csv
 import fnmatch
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,8 @@ import torch
 from torch import nn
 
 from .visualizer import draw_activation_charts
+
+logger = logging.getLogger(__name__)
 
 
 def _to_tensor(output: Any) -> torch.Tensor | None:
@@ -212,6 +215,10 @@ class _AnalyzerModel(nn.Module):
         self._register_hooks()
         atexit.register(self._finalize_on_exit)
 
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            logger.info("[acta] %s", message)
+
     def _resolve_versioned_dump_paths(self) -> tuple[Path, Path, str]:
         """
         Returns (dump_root, run_dir, json_path) with layout::
@@ -288,8 +295,8 @@ class _AnalyzerModel(nn.Module):
 
     def _maybe_set_prompt_len_from_tensor(self, tensor: torch.Tensor) -> None:
         if self._prompt_len is None and tensor.ndim == 3:
-            # Works for LLMs and ViTs: treat dim=1 as sequence length.
             self._prompt_len = int(tensor.shape[1])
+            self._log(f"captured prompt length from hook: {self._prompt_len}")
 
     def _default_position_tokens(self, n: int) -> list[str]:
         if n <= 0:
@@ -371,7 +378,6 @@ class _AnalyzerModel(nn.Module):
                                 tok_max = abs_act.max(dim=-1).values.cpu()  # [T]
                                 self._run_token_maxabs_by_layer.setdefault(layer_name, []).append(tok_max)
 
-                                # Per-layer per-token/per-feature max magnitude across generation steps.
                                 abs_cpu = abs_act.cpu()
                                 if layer_name not in self._run_max_abs_token_feature_by_layer:
                                     self._run_max_abs_token_feature_by_layer[layer_name] = abs_cpu
@@ -416,11 +422,13 @@ class _AnalyzerModel(nn.Module):
                 self._layer_values.setdefault(layer_name, []).append(flattened.cpu())
 
             self._hooks.append(module.register_forward_hook(_hook_fn))
+            self._log(f"hook registered for layer: {name}")
 
     def reset_stats(self) -> None:
         self._layer_values.clear()
 
     def _build_stats(self) -> dict[str, Any]:
+        self._log(f"aggregating activation statistics from {len(self._layer_values)} layers")
         layers: dict[str, Any] = {}
         for layer_name, chunks in self._layer_values.items():
             if not chunks:
@@ -434,6 +442,7 @@ class _AnalyzerModel(nn.Module):
     def _finalize_on_exit(self) -> None:
         if self._final_dump_done:
             return
+        self._log("finalizing analyzer output")
         self._dump_stats(draw_charts=self.draw_charts)
 
     def _merge_outliers_across_calls(self, run_outliers: dict[str, Any] | None) -> None:
@@ -441,6 +450,7 @@ class _AnalyzerModel(nn.Module):
             return
         if self._aggregate_generate_outliers is None:
             self._aggregate_generate_outliers = copy.deepcopy(run_outliers)
+            self._log("initialized outlier aggregation state")
             return
 
         agg = self._aggregate_generate_outliers
@@ -459,6 +469,7 @@ class _AnalyzerModel(nn.Module):
         merged_flags = [a or b for a, b in zip(agg_flags, run_flags, strict=False)]
         agg["outliers"] = merged_flags
         agg["token_count"] = int(max(int(agg.get("token_count", 0)), int(run_outliers.get("token_count", 0))))
+        self._log(f"aggregated outliers across calls (tokens={n})")
 
         for key, fill in (("prompt_tokens", ""), ("prompt_token_ids", ""), ("per_token_layer", None), ("per_token_channel_dim", None)):
             agg_vals = _pad(list(agg.get(key, [])), fill, n)
@@ -499,6 +510,7 @@ class _AnalyzerModel(nn.Module):
         self._write_acta_results_csv()
         if draw_charts:
             chart_dir = Path(self.dump_stats_path).parent
+            self._log(f"creating charts in: {chart_dir.as_posix()}")
             draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
         self._final_dump_done = bool(draw_charts)
 
@@ -515,7 +527,6 @@ class _AnalyzerModel(nn.Module):
         finally:
             self._in_generate = False
 
-        # Build a pseudo "outliers" payload based on collected sequence stats, if any.
         if self._prompt_len is not None:
             use_len = int(self._prompt_len)
             token_ids = list(range(use_len))
@@ -548,7 +559,7 @@ class _AnalyzerModel(nn.Module):
         if self.verbose and self._aggregate_generate_outliers is not None:
             table = self._aggregate_generate_outliers.get("table")
             if table:
-                print(table)
+                logger.info("\n%s", table)
         self._dump_stats(draw_charts=False)
         return result
 
@@ -576,7 +587,7 @@ class _AnalyzerModel(nn.Module):
         if self.verbose and self._aggregate_generate_outliers is not None:
             table = self._aggregate_generate_outliers.get("table")
             if table:
-                print(table)
+                logger.info("\n%s", table)
         self._dump_stats(draw_charts=False)
         return result
 
@@ -645,7 +656,6 @@ class _AnalyzerModel(nn.Module):
         if self._run_feature_counts_by_layer and self._run_feature_token_count_by_layer:
             eligible_layers = [ln for ln in layer_names if ln in self._run_feature_counts_by_layer]
             if eligible_layers:
-                # Only compare layers that share the same feature dimension H.
                 lengths = [int(self._run_feature_counts_by_layer[ln].shape[0]) for ln in eligible_layers]
                 h = int(max(set(lengths), key=lengths.count))
                 eligible_layers = [ln for ln in eligible_layers if int(self._run_feature_counts_by_layer[ln].shape[0]) == h]
@@ -682,7 +692,6 @@ class _AnalyzerModel(nn.Module):
                     continue
                 token_feature_magnitude_by_layer[ln] = ten[:t_use, outlier_feature_dims].cpu().tolist()
 
-        # For each token: pick the strongest outlier dim (among detected outlier dims).
         per_token_layer: list[str | None] = [None] * int(use_len)
         per_token_channel_dim: list[int | None] = [None] * int(use_len)
         if self._run_max_abs_token_feature is not None and outlier_feature_dims:
@@ -698,7 +707,6 @@ class _AnalyzerModel(nn.Module):
                     if 0 <= li < len(self._run_layer_order):
                         per_token_layer[ti] = self._run_layer_order[li]
 
-        # 3D chart payload for all layers: token × layer × max-magnitude (over hidden dims).
         token_layer_max_magnitude: list[list[float]] | None = None
         if self._run_token_maxabs_by_layer:
             layer_list = sorted(self._run_token_maxabs_by_layer.keys())
@@ -731,7 +739,7 @@ class _AnalyzerModel(nn.Module):
             ),
             "token_trends": token_trends,
             "outlier_feature_dims": outlier_feature_dims,
-            "token_feature_magnitude": token_feature_magnitude,  # [token][feature] magnitudes (abs max over layers)
+            "token_feature_magnitude": token_feature_magnitude,
             "token_feature_magnitude_by_layer": token_feature_magnitude_by_layer,
             "token_layer_trends": {
                 "layer_names": sorted(self._run_token_maxabs_by_layer.keys()),

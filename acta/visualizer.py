@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+import warnings
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_filename(value: str) -> str:
@@ -61,7 +65,6 @@ def _subsample_rows_list2d(rows: list[list[float]], idx: np.ndarray) -> list[lis
 
 
 def _subsample_cols_list2d(max_abs: list[list[float]], idx: np.ndarray) -> list[list[float]]:
-    """max_abs is [L][T]; keep columns idx."""
     out = []
     for row in max_abs:
         out.append([row[int(i)] for i in idx])
@@ -140,7 +143,7 @@ def _plot_outlier_token_feature_3d(outliers: dict[str, Any], output_dir: Path) -
     max_per_feat = mags.max(axis=0)  # [F]
     topk = min(3, f)
     top_feat_idx = np.argsort(-max_per_feat)[:topk]
-    top_feat_idx = np.sort(top_feat_idx)  # stable left-to-right
+    top_feat_idx = np.sort(top_feat_idx)
 
     feat_dims = [feat_dims[int(i)] for i in top_feat_idx]
     mags = mags[:, top_feat_idx]  # [T, topk]
@@ -326,13 +329,16 @@ def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
         return
     outliers = stats.get("outliers", {})
 
-    sns.set_theme(style="whitegrid")
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    logger.info("[acta] creating charts in: %s", output_dir)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sns.set_theme(style="whitegrid")
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
 
-    if isinstance(outliers, dict):
-        _plot_token_trends(outliers, out)
-        _plot_outlier_token_feature_3d(outliers, out)
-        _plot_outlier_token_feature_3d_per_layer(outliers, out)
-        _plot_token_layer_3d(outliers, out)
-    _plot_layer_channel_hist(layers, out)
+        if isinstance(outliers, dict):
+            _plot_token_trends(outliers, out)
+            _plot_outlier_token_feature_3d(outliers, out)
+            _plot_outlier_token_feature_3d_per_layer(outliers, out)
+            _plot_token_layer_3d(outliers, out)
+        _plot_layer_channel_hist(layers, out)
