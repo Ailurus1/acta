@@ -179,6 +179,8 @@ class _AnalyzerModel(nn.Module):
         verbose: bool = False,
         tokenizer: Any | None = None,
         vit_reg_patch_labels: bool = False,
+        asr_chunk_labels: bool = False,
+        chart_3d_max_tokens: int = 24,
     ) -> None:
         super().__init__()
         self.model = model
@@ -192,6 +194,8 @@ class _AnalyzerModel(nn.Module):
         self.verbose = bool(verbose)
         self.tokenizer = tokenizer
         self.vit_reg_patch_labels = bool(vit_reg_patch_labels)
+        self.asr_chunk_labels = bool(asr_chunk_labels)
+        self.chart_3d_max_tokens = int(chart_3d_max_tokens)
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._layer_values: dict[str, list[torch.Tensor]] = {}
         self._in_generate: bool = False
@@ -242,9 +246,11 @@ class _AnalyzerModel(nn.Module):
         return ["cls"] + [f"pos_{i}" for i in range(1, n)]
 
     def _sequence_position_labels(self, n: int) -> list[str]:
-        """Labels for sequence positions when tokenizer is None (e.g. ViT patches)."""
+        """Labels for sequence positions when tokenizer is None (e.g. ViT patches, ASR chunks)."""
         if n <= 0:
             return []
+        if self.asr_chunk_labels:
+            return [f"chunk_{i}" for i in range(n)]
         if self.vit_reg_patch_labels:
             return [f"reg_{i}" for i in range(n)]
         return self._default_position_tokens(n)
@@ -375,6 +381,7 @@ class _AnalyzerModel(nn.Module):
     def _dump_stats(self) -> None:
         stats = self._build_stats()
         if self._last_generate_outliers is not None:
+            self._last_generate_outliers["chart_3d_max_tokens"] = self.chart_3d_max_tokens
             stats["outliers"] = self._last_generate_outliers
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
@@ -652,7 +659,9 @@ def AutoAnalyzer(
     hard_seqdim_frac: float = 0.06,
     verbose: bool = False,
     tokenizer: Any | None = None,
-    vit_reg_patch_labels: bool = True,
+    vit_reg_patch_labels: bool = False,
+    asr_chunk_labels: bool = False,
+    chart_3d_max_tokens: int = 24,
 ) -> nn.Module:
     return _AnalyzerModel(
         model=model,
@@ -666,4 +675,6 @@ def AutoAnalyzer(
         verbose=verbose,
         tokenizer=tokenizer,
         vit_reg_patch_labels=vit_reg_patch_labels,
+        asr_chunk_labels=asr_chunk_labels,
+        chart_3d_max_tokens=chart_3d_max_tokens,
     )

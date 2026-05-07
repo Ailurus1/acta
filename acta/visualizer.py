@@ -38,6 +38,35 @@ def _upsample_grid(z: np.ndarray, up_x: int = 6, up_y: int = 4) -> np.ndarray:
     z_xy = np.vstack([np.interp(y_new, y_old, z_x[:, j]) for j in range(z_x.shape[1])]).T
     return z_xy
 
+
+def _chart_3d_token_limit(outliers: dict[str, Any]) -> int:
+    v = outliers.get("chart_3d_max_tokens", 24)
+    try:
+        return max(4, int(v))
+    except (TypeError, ValueError):
+        return 24
+
+
+def _subsample_token_axis(
+    tokens: list[str],
+    indices: np.ndarray,
+) -> tuple[list[str], np.ndarray]:
+    idx = indices.astype(int)
+    tok = [tokens[i] for i in idx]
+    return tok, idx
+
+
+def _subsample_rows_list2d(rows: list[list[float]], idx: np.ndarray) -> list[list[float]]:
+    return [rows[int(i)] for i in idx]
+
+
+def _subsample_cols_list2d(max_abs: list[list[float]], idx: np.ndarray) -> list[list[float]]:
+    """max_abs is [L][T]; keep columns idx."""
+    out = []
+    for row in max_abs:
+        out.append([row[int(i)] for i in idx])
+    return out
+
 def _plot_token_trends(outliers: dict[str, Any], output_dir: Path) -> None:
     token_trends = outliers.get("token_trends")
     if not token_trends:
@@ -99,6 +128,13 @@ def _plot_outlier_token_feature_3d(outliers: dict[str, Any], output_dir: Path) -
     if len(magnitudes) != t or any(len(row) != f for row in magnitudes):
         return
 
+    max_3d = _chart_3d_token_limit(outliers)
+    if t > max_3d:
+        idx = np.linspace(0, t - 1, max_3d, dtype=int)
+        tokens, _ = _subsample_token_axis(tokens, idx)
+        magnitudes = _subsample_rows_list2d(magnitudes, idx)
+        t = len(tokens)
+
     mags = np.array(magnitudes, dtype=np.float32)  # [T, F]
 
     max_per_feat = mags.max(axis=0)  # [F]
@@ -151,11 +187,23 @@ def _plot_outlier_token_feature_3d_per_layer(outliers: dict[str, Any], output_di
     per_layer_dir = output_dir / "outlier_token_feature_3d_per_layer"
     per_layer_dir.mkdir(parents=True, exist_ok=True)
 
+    max_3d = _chart_3d_token_limit(outliers)
+    idx = None
+    tokens_plot = tokens
+    if len(tokens) > max_3d:
+        idx = np.linspace(0, len(tokens) - 1, max_3d, dtype=int)
+        tokens_plot, _ = _subsample_token_axis(tokens, idx)
+
     for layer_name, magnitudes in mags_by_layer.items():
-        if len(magnitudes) != t or any(len(row) != f for row in magnitudes):
+        if len(magnitudes) != len(tokens) or any(len(row) != f for row in magnitudes):
             continue
 
-        mags_tf = np.array(magnitudes, dtype=np.float32)  # [T, F]
+        mags_rows = magnitudes
+        if idx is not None:
+            mags_rows = _subsample_rows_list2d(magnitudes, idx)
+        t_plot = len(mags_rows)
+
+        mags_tf = np.array(mags_rows, dtype=np.float32)  # [T, F]
         max_per_feat = mags_tf.max(axis=0)
         topk = min(3, f)
         top_feat_idx = np.argsort(-max_per_feat)[:topk]
@@ -169,15 +217,15 @@ def _plot_outlier_token_feature_3d_per_layer(outliers: dict[str, Any], output_di
         pretty_layer = _pretty_layer_name(layer_name)
         fname_base = _sanitize_filename(pretty_layer)
 
-        fig = plt.figure(figsize=(max(12, t * 0.6), 7))
+        fig = plt.figure(figsize=(max(12, t_plot * 0.6), 7))
         ax = fig.add_subplot(111, projection="3d")
         X, Y = np.meshgrid(np.arange(t_up), np.arange(f_up))
         ax.plot_wireframe(X, Y, mags_up, rstride=1, cstride=1, color="royalblue", linewidth=1.5)
         ax.set_xlabel("Token", labelpad=20)
         ax.set_ylabel("Feature dim", labelpad=20)
         ax.set_zlabel("Magnitude (abs)", labelpad=20)
-        ax.set_xticks(np.linspace(0, t_up - 1, t))
-        ax.set_xticklabels(tokens, rotation=50, ha="right")
+        ax.set_xticks(np.linspace(0, t_up - 1, t_plot))
+        ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
         ax.set_yticks(np.linspace(0, f_up - 1, len(feat_dims_top)))
         ax.set_yticklabels([str(d) for d in feat_dims_top])
         ax.tick_params(axis="x", which="major")
@@ -209,7 +257,16 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     if len(max_abs) != l or any(len(row) != t for row in max_abs):
         return
 
-    mags = np.array(max_abs, dtype=np.float32)  # [L, T]
+    max_3d = _chart_3d_token_limit(outliers)
+    tokens_plot = tokens
+    max_abs_plot = max_abs
+    if t > max_3d:
+        idx = np.linspace(0, t - 1, max_3d, dtype=int)
+        tokens_plot, _ = _subsample_token_axis(tokens, idx)
+        max_abs_plot = _subsample_cols_list2d(max_abs, idx)
+        t = len(tokens_plot)
+
+    mags = np.array(max_abs_plot, dtype=np.float32)  # [L, T]
 
     thr = float(outliers.get("threshold", 6.0))
     keep = np.where((mags >= thr).any(axis=1))[0]
@@ -229,7 +286,7 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     ax.set_ylabel("Layer")
     ax.set_zlabel("Max |activation| over hidden dims")
     ax.set_xticks(np.linspace(0, t_up - 1, t))
-    ax.set_xticklabels(tokens, rotation=50, ha="right")
+    ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
     ax.set_yticks(np.linspace(0, l_up - 1, l))
     ax.set_yticklabels(layer_names)
     ax.tick_params(axis="x", which="major", pad=-4)

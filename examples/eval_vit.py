@@ -51,10 +51,12 @@ def main() -> None:
     model = AutoAnalyzer(
         base_model,
         dump_stats_path="./vit_activations_analysis.json",
-        target_layers="*layer.*.layernorm_after",
+        target_layers="*layer.*.layernorm_before",
         draw_charts=True,
         verbose=True,
         tokenizer=None,
+        vit_reg_patch_labels=True,
+        asr_chunk_labels=False,
     )
     model.eval()
 
