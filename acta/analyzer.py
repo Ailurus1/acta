@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import fnmatch
 import json
 import re
@@ -105,21 +106,10 @@ def _token_outlier_fraction(x: torch.Tensor, threshold: float) -> torch.Tensor |
     return frac
 
 
-def _format_outlier_table(token_ids: list[int], soft: list[bool], hard: list[bool]) -> str:
-    lines = []
-    header = f"{'idx':>5}  {'token':>10}  {'soft definition':>15}  {'hard definition':>15}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    for i, (tid, s, h) in enumerate(zip(token_ids, soft, hard, strict=False)):
-        lines.append(f"{i:>5}  {tid:>10}  {str(s):>15}  {str(h):>15}")
-    return "\n".join(lines)
-
-
 def _format_outlier_table_decoded(
     tokens: list[str],
     token_ids: list[int],
-    soft: list[bool],
-    hard: list[bool],
+    outliers: list[bool],
     layers: list[str | None],
     channel_dims: list[int | None],
 ) -> str:
@@ -130,17 +120,17 @@ def _format_outlier_table_decoded(
     lines = []
     header = (
         f"{'idx':>5}  {'token':<22}  {'token_id':>10}  {'layer':<32}  {'channel_dim':>11}"
-        f"  {'soft definition':>15}  {'hard definition':>15}"
+        f"  {'outliers':>15}"
     )
     lines.append(header)
     lines.append("-" * len(header))
-    for i, (tok, tid, layer, dim, s, h) in enumerate(
-        zip(tokens, token_ids, layers, channel_dims, soft, hard, strict=False)
+    for i, (tok, tid, layer, dim, o) in enumerate(
+        zip(tokens, token_ids, layers, channel_dims, outliers, strict=False)
     ):
         layer_s = "" if layer is None else layer
         dim_s = "" if dim is None else str(dim)
         lines.append(
-            f"{i:>5}  {_short(tok):<22}  {tid:>10}  {layer_s:<32}  {dim_s:>11}  {str(s):>15}  {str(h):>15}"
+            f"{i:>5}  {_short(tok):<22}  {tid:>10}  {layer_s:<32}  {dim_s:>11}  {str(o):>15}"
         )
     return "\n".join(lines)
 
@@ -156,13 +146,13 @@ def decode_token(tokenizer: Any, token_id: int) -> str:
                 clean_up_tokenization_spaces=False,
             )
         except Exception:
-            print(f"Error decoding token {token_id} with tokenizer {tokenizer}")
+            pass
     if hasattr(tokenizer, "convert_ids_to_tokens"):
         try:
             tok = tokenizer.convert_ids_to_tokens([token_id])[0]
             return tok if tok is not None else str(token_id)
         except Exception:
-            print(f"Error converting token {token_id} to tokens with tokenizer {tokenizer}")
+            pass
     return str(token_id)
 
 
@@ -173,7 +163,6 @@ class _AnalyzerModel(nn.Module):
         dump_stats_path: str | None,
         target_layers: str | list[str] | None = None,
         draw_charts: bool = False,
-        outlier_method: str = "both",
         outlier_threshold: float = 6.0,
         hard_layers_frac: float = 0.25,
         hard_seqdim_frac: float = 0.06,
@@ -190,7 +179,6 @@ class _AnalyzerModel(nn.Module):
         self.dump_stats_root, self.output_run_dir, self.dump_stats_path = self._resolve_versioned_dump_paths()
         self.target_layers = target_layers
         self.draw_charts = draw_charts
-        self.outlier_method = outlier_method
         self.outlier_threshold = float(outlier_threshold)
         self.hard_layers_frac = float(hard_layers_frac)
         self.hard_seqdim_frac = float(hard_seqdim_frac)
@@ -248,6 +236,33 @@ class _AnalyzerModel(nn.Module):
         run_dir.mkdir(parents=True, exist_ok=True)
         json_path = run_dir / json_name
         return dump_root, run_dir, str(json_path)
+
+    def _write_acta_results_csv(self) -> None:
+        path = self.output_run_dir / "acta_results.csv"
+        fieldnames = ["idx", "token", "token_id", "layer", "channel_dim", "outliers"]
+        rows: list[dict[str, Any]] = []
+        if self._last_generate_outliers is not None:
+            tokens = self._last_generate_outliers.get("prompt_tokens", [])
+            tids = self._last_generate_outliers.get("prompt_token_ids", [])
+            outlier_flags = self._last_generate_outliers.get("outliers", [])
+            layers = self._last_generate_outliers.get("per_token_layer", [])
+            dims = self._last_generate_outliers.get("per_token_channel_dim", [])
+            for i, tok in enumerate(tokens):
+                rows.append(
+                    {
+                        "idx": i,
+                        "token": tok,
+                        "token_id": tids[i] if i < len(tids) else "",
+                        "layer": layers[i] if i < len(layers) and layers[i] is not None else "",
+                        "channel_dim": dims[i] if i < len(dims) and dims[i] is not None else "",
+                        "outliers": outlier_flags[i] if i < len(outlier_flags) else "",
+                    }
+                )
+        self.dump_stats_root.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
     def _reset_run_sequence_buffers(self) -> None:
         self._run_token_frac_by_layer.clear()
@@ -421,9 +436,11 @@ class _AnalyzerModel(nn.Module):
             "output_run_dir": self.output_run_dir.as_posix(),
             "dump_stats_path": self.dump_stats_path,
             "session_timestamp": self._session_timestamp,
+            "results_csv": (self.dump_stats_root / "acta_results.csv").as_posix(),
         }
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
+        self._write_acta_results_csv()
         if self.draw_charts:
             chart_dir = Path(self.dump_stats_path).parent
             draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
@@ -458,16 +475,14 @@ class _AnalyzerModel(nn.Module):
                 if "token_trends" in self._last_generate_outliers and isinstance(self._last_generate_outliers["token_trends"], dict):
                     self._last_generate_outliers["token_trends"]["tokens"] = decoded
                     self._last_generate_outliers["token_trends"]["token_ids"] = token_ids
-                if "soft_definition" in self._last_generate_outliers and "hard_definition" in self._last_generate_outliers:
-                    soft = self._last_generate_outliers.get("soft_definition", [])
-                    hard = self._last_generate_outliers.get("hard_definition", [])
+                if "outliers" in self._last_generate_outliers:
+                    outlier_flags = self._last_generate_outliers.get("outliers", [])
                     layers = self._last_generate_outliers.get("per_token_layer", [None] * len(decoded))
                     dims = self._last_generate_outliers.get("per_token_channel_dim", [None] * len(decoded))
                     self._last_generate_outliers["table"] = _format_outlier_table_decoded(
                         tokens=decoded,
                         token_ids=token_ids,
-                        soft=soft,
-                        hard=hard,
+                        outliers=outlier_flags,
                         layers=layers,
                         channel_dims=dims,
                     )
@@ -521,30 +536,24 @@ class _AnalyzerModel(nn.Module):
         if not layer_names:
             return {
                 "threshold": self.outlier_threshold,
-                "soft_definition": [],
-                "hard_definition": [],
+                "outliers": [],
                 "note": "No eligible [B,S,H] activations were captured during generate().",
             }
 
         t_min = min(t.shape[1] for t in per_layer_frac.values())
         frac_stack = torch.stack([per_layer_frac[name][:, :t_min] for name in layer_names], dim=0)  # [L, B, T]
 
-        # Soft: any hidden dim exceeds threshold in any layer -> frac>0 for some layer.
-        soft_mask = (frac_stack > 0.0).any(dim=0)  # [B, T]
-
-        # Hard: >=25% layers have >=6% hidden dims exceeding threshold.
+        # Hard (LLM.int8-style): >=25% layers have >=seqdim_fraction hidden dims exceeding threshold.
         layer_affected = frac_stack >= self.hard_seqdim_frac  # [L, B, T]
         frac_layers_affected = layer_affected.to(torch.float32).mean(dim=0)  # [B, T]
         hard_mask = frac_layers_affected >= self.hard_layers_frac
 
         token_ids_full = generate_result[0, :t_min].detach().cpu().tolist()
-        soft_full = soft_mask[0].detach().cpu().tolist()
         hard_full = hard_mask[0].detach().cpu().tolist()
 
         use_len = min(prompt_len, t_min) if prompt_len is not None else t_min
         token_ids = token_ids_full[:use_len]
-        soft_list = soft_full[:use_len]
-        hard_list = hard_full[:use_len]
+        outliers_list = hard_full[:use_len]
         decoded_tokens = [decode_token(self.tokenizer, tid) for tid in token_ids]
 
         per_layer_mean: dict[str, torch.Tensor] = {}
@@ -652,8 +661,7 @@ class _AnalyzerModel(nn.Module):
             },
             "num_layers_considered": len(layer_names),
             "token_count": int(use_len),
-            "soft_definition": soft_list,
-            "hard_definition": hard_list,
+            "outliers": outliers_list,
             "prompt_token_ids": token_ids,
             "prompt_tokens": decoded_tokens,
             "per_token_layer": per_token_layer,
@@ -661,8 +669,7 @@ class _AnalyzerModel(nn.Module):
             "table": _format_outlier_table_decoded(
                 tokens=decoded_tokens,
                 token_ids=token_ids,
-                soft=soft_list,
-                hard=hard_list,
+                outliers=outliers_list,
                 layers=per_token_layer,
                 channel_dims=per_token_channel_dim,
             ),
@@ -692,7 +699,6 @@ def AutoAnalyzer(
     dump_stats_path: str | None = None,
     target_layers: str | list[str] | None = None,
     draw_charts: bool = False,
-    outlier_method: str = "both",
     outlier_threshold: float = 6.0,
     hard_layers_frac: float = 0.25,
     hard_seqdim_frac: float = 0.06,
@@ -707,7 +713,6 @@ def AutoAnalyzer(
         dump_stats_path=dump_stats_path,
         target_layers=target_layers,
         draw_charts=draw_charts,
-        outlier_method=outlier_method,
         outlier_threshold=outlier_threshold,
         hard_layers_frac=hard_layers_frac,
         hard_seqdim_frac=hard_seqdim_frac,

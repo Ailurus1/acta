@@ -12,7 +12,6 @@ def main() -> None:
     model = AutoAnalyzer(
         model,
         tokenizer=tokenizer,
-        dump_stats_path="./gpt2_activations_analysis",
         target_layers=["*Block"],
         draw_charts=True,
         verbose=True,
