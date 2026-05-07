@@ -12,10 +12,10 @@ def main() -> None:
     model = AutoAnalyzer(
         model,
         tokenizer=tokenizer,
-        dump_stats_path="./activations_analysis.json",
+        dump_stats_path="./gpt2_activations_analysis",
         target_layers=["*Block"],
         draw_charts=True,
-        verbose=True
+        verbose=True,
     )
 
     inputs = tokenizer("Summer is warm. Winter is cold.", return_tensors="pt").to(model.device)

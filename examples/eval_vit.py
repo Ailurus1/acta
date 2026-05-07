@@ -50,7 +50,7 @@ def main() -> None:
 
     model = AutoAnalyzer(
         base_model,
-        dump_stats_path="./vit_activations_analysis.json",
+        dump_stats_path="./vit_activations_analysis",
         target_layers="*layer.*.layernorm_before",
         draw_charts=True,
         verbose=True,
@@ -65,8 +65,6 @@ def main() -> None:
 
     with torch.no_grad():
         _ = model(**inputs)
-
-    print("Wrote ./vit_activations_analysis.json and charts under ./vit_activations_analysis/")
 
 
 if __name__ == "__main__":

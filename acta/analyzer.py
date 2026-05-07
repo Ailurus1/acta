@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -169,7 +170,7 @@ class _AnalyzerModel(nn.Module):
     def __init__(
         self,
         model: nn.Module,
-        dump_stats_path: str,
+        dump_stats_path: str | None,
         target_layers: str | list[str] | None = None,
         draw_charts: bool = False,
         outlier_method: str = "both",
@@ -184,7 +185,9 @@ class _AnalyzerModel(nn.Module):
     ) -> None:
         super().__init__()
         self.model = model
-        self.dump_stats_path = dump_stats_path
+        self._dump_stats_path_spec = dump_stats_path
+        self._session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.dump_stats_root, self.output_run_dir, self.dump_stats_path = self._resolve_versioned_dump_paths()
         self.target_layers = target_layers
         self.draw_charts = draw_charts
         self.outlier_method = outlier_method
@@ -215,6 +218,36 @@ class _AnalyzerModel(nn.Module):
         self._run_token_maxabs_by_layer: dict[str, list[torch.Tensor]] = {}
         self._last_generate_outliers: dict[str, Any] | None = None
         self._register_hooks()
+
+    def _resolve_versioned_dump_paths(self) -> tuple[Path, Path, str]:
+        """
+        Returns (dump_root, run_dir, json_path) with layout::
+
+            <dump_root>/<timestamp>/
+
+        where ``dump_root`` is the user-facing output root (``dump_stats_path``
+        when it names a directory).
+        """
+        spec = self._dump_stats_path_spec
+        if spec is None or str(spec).strip() == "":
+            dump_root = Path(".acta_dump_results")
+            json_name = "stats.json"
+        else:
+            p = Path(spec)
+            if p.suffix.lower() == ".json":
+                dump_root = p.parent
+                if dump_root == Path(""):
+                    dump_root = Path(".")
+                json_name = p.name
+            else:
+                dump_root = Path(spec)
+                json_name = "stats.json"
+
+        dump_root = dump_root.resolve()
+        run_dir = (dump_root / self._session_timestamp).resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        json_path = run_dir / json_name
+        return dump_root, run_dir, str(json_path)
 
     def _reset_run_sequence_buffers(self) -> None:
         self._run_token_frac_by_layer.clear()
@@ -383,10 +416,16 @@ class _AnalyzerModel(nn.Module):
         if self._last_generate_outliers is not None:
             self._last_generate_outliers["chart_3d_max_tokens"] = self.chart_3d_max_tokens
             stats["outliers"] = self._last_generate_outliers
+        stats["_acta"] = {
+            "dump_stats_root": self.dump_stats_root.as_posix(),
+            "output_run_dir": self.output_run_dir.as_posix(),
+            "dump_stats_path": self.dump_stats_path,
+            "session_timestamp": self._session_timestamp,
+        }
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
         if self.draw_charts:
-            chart_dir = Path(self.dump_stats_path).with_suffix("")
+            chart_dir = Path(self.dump_stats_path).parent
             draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
 
     def _run_and_dump(self, runner: Any, *args: Any, **kwargs: Any) -> Any:
@@ -650,7 +689,7 @@ class _AnalyzerModel(nn.Module):
 
 def AutoAnalyzer(
     model: nn.Module,
-    dump_stats_path: str = "./activations_analysis.json",
+    dump_stats_path: str | None = None,
     target_layers: str | list[str] | None = None,
     draw_charts: bool = False,
     outlier_method: str = "both",

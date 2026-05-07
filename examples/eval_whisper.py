@@ -15,11 +15,12 @@ def main() -> None:
     processor = WhisperProcessor.from_pretrained(model_id)
     full_model = WhisperForConditionalGeneration.from_pretrained(model_id)
     encoder = full_model.get_encoder()
-
+    # print(encoder)
+    # return
     model = AutoAnalyzer(
         encoder,
-        dump_stats_path="./whisper_encoder_analysis.json",
-        target_layers="*layers*",
+        dump_stats_path="./whisper_encoder_analysis",
+        target_layers="*out_proj*",
         draw_charts=True,
         verbose=True,
         tokenizer=None,
