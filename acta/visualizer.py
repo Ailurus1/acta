@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from pathlib import Path
@@ -391,3 +392,18 @@ def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
             _plot_outlier_token_feature_3d_per_layer(outliers, out)
             _plot_token_layer_3d(outliers, out)
         _plot_layer_channel_hist(layers, out)
+
+
+def build_charts_from_stats_file(
+    stats_path: str | Path,
+    output_dir: str | Path | None = None,
+) -> Path:
+    stats_file = Path(stats_path).expanduser().resolve()
+    if not stats_file.exists():
+        raise FileNotFoundError(f"Stats file not found: {stats_file}")
+    with open(stats_file, "r", encoding="utf-8") as f:
+        stats = json.load(f)
+
+    out_dir = Path(output_dir).expanduser().resolve() if output_dir is not None else stats_file.parent
+    draw_activation_charts(stats=stats, output_dir=out_dir.as_posix())
+    return out_dir

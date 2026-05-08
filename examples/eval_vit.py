@@ -14,6 +14,14 @@ from acta import AutoAnalyzer
 IMAGE_URL = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSts3LZY5r_gDJHykCjup1i4ckZrX7Ed7TT2A&s"
 
 
+def _preferred_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def _quiet_hf() -> None:
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -57,9 +65,11 @@ def main() -> None:
         asr_chunk_labels=False,
     )
     model.eval()
+    device = _preferred_device()
+    model.to(device)
 
     image = load_image_from_url(IMAGE_URL)
-    inputs = processor(images=image, return_tensors="pt")
+    inputs = processor(images=image, return_tensors="pt").to(device)
 
     with torch.no_grad():
         _ = model(**inputs)
