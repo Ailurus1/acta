@@ -42,6 +42,18 @@ def _gpt2_input() -> dict[str, Any]:
     return {"input_ids": torch.tensor([[1, 5, 7, 9, 11, 2]], dtype=torch.long)}
 
 
+def _gpt2_batched_input() -> dict[str, Any]:
+    return {
+        "input_ids": torch.tensor(
+            [
+                [1, 5, 7, 9, 11, 2],
+                [1, 6, 8, 10, 12, 2],
+            ],
+            dtype=torch.long,
+        )
+    }
+
+
 def _gpt2_run(model: nn.Module, inp: dict[str, Any]) -> Any:
     with torch.no_grad():
         return model.generate(**inp, max_new_tokens=3)
@@ -69,6 +81,20 @@ def _distilbert_input() -> dict[str, Any]:
     }
 
 
+def _distilbert_batched_input() -> dict[str, Any]:
+    input_ids = torch.tensor(
+        [
+            [3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43],
+            [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+        ],
+        dtype=torch.long,
+    )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones((2, 12), dtype=torch.long),
+    }
+
+
 def _forward_run(model: nn.Module, inp: dict[str, Any]) -> Any:
     with torch.no_grad():
         return model(**inp)
@@ -92,6 +118,13 @@ def _vit_input() -> dict[str, Any]:
     vals = torch.linspace(
         -1.0, 1.0, steps=1 * 3 * 32 * 32, dtype=torch.float32
     ).reshape(1, 3, 32, 32)
+    return {"pixel_values": vals}
+
+
+def _vit_batched_input() -> dict[str, Any]:
+    vals = torch.linspace(
+        -1.0, 1.0, steps=2 * 3 * 32 * 32, dtype=torch.float32
+    ).reshape(2, 3, 32, 32)
     return {"pixel_values": vals}
 
 
@@ -123,11 +156,25 @@ def _whisper_input() -> dict[str, Any]:
     return {"input_features": vals}
 
 
+def _whisper_batched_input() -> dict[str, Any]:
+    vals = torch.linspace(
+        -0.5, 0.5, steps=2 * 80 * 128, dtype=torch.float32
+    ).reshape(2, 80, 128)
+    return {"input_features": vals}
+
+
 CASES: list[tuple[str, ModelBuilder, InputBuilder, RunFn]] = [
     ("gpt2", _gpt2_builder, _gpt2_input, _gpt2_run),
     ("whisper_tiny", _whisper_builder, _whisper_input, _forward_run),
     ("distilbert", _distilbert_builder, _distilbert_input, _forward_run),
     ("vit", _vit_builder, _vit_input, _forward_run),
+]
+
+BATCH_CASES: list[tuple[str, ModelBuilder, InputBuilder, RunFn]] = [
+    ("gpt2", _gpt2_builder, _gpt2_batched_input, _gpt2_run),
+    ("whisper_tiny", _whisper_builder, _whisper_batched_input, _forward_run),
+    ("distilbert", _distilbert_builder, _distilbert_batched_input, _forward_run),
+    ("vit", _vit_builder, _vit_batched_input, _forward_run),
 ]
 
 
@@ -283,3 +330,36 @@ def test_eval_models_create_all_charts(
     assert (run_dir / "token_layer_maxabs_3d.png").exists()
     assert (run_dir / "outlier_token_feature_3d_per_layer").exists()
     assert list((run_dir / "outlier_token_feature_3d_per_layer").glob("*.png"))
+
+
+@pytest.mark.parametrize("case_name,model_builder,input_builder,run_fn", BATCH_CASES)
+def test_batched_inference_creates_valid_stats_and_outliers(
+    tmp_path: Path,
+    case_name: str,
+    model_builder: ModelBuilder,
+    input_builder: InputBuilder,
+    run_fn: RunFn,
+) -> None:
+    wrapped, stats = _run_case(
+        tmp_path,
+        f"{case_name}_batched",
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=False,
+        num_calls=1,
+    )
+    run_dir = Path(wrapped.output_run_dir)
+    csv_path = run_dir / "acta_results.csv"
+
+    assert Path(wrapped.dump_stats_path).exists()
+    assert csv_path.exists()
+    assert "layers" in stats and stats["layers"]
+    first_layer = next(iter(stats["layers"].values()))
+    assert int(first_layer["num_observations"]) > 0
+
+    outliers = stats.get("outliers", {})
+    if isinstance(outliers, dict) and "outliers" in outliers:
+        token_count = int(outliers.get("token_count", 0))
+        flags = outliers.get("outliers", [])
+        assert len(flags) == token_count

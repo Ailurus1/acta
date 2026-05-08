@@ -310,6 +310,12 @@ class _AnalyzerModel(nn.Module):
         self._run_layer_to_index.clear()
         self._run_token_maxabs_by_layer.clear()
 
+    def _current_run_batch_size(self) -> int:
+        for chunks in self._run_token_frac_by_layer.values():
+            if chunks:
+                return int(chunks[0].shape[0])
+        return 1
+
     def _maybe_set_prompt_len_from_tensor(self, tensor: torch.Tensor) -> None:
         if self._prompt_len is None and tensor.ndim == 3:
             self._prompt_len = int(tensor.shape[1])
@@ -415,16 +421,16 @@ class _AnalyzerModel(nn.Module):
                             b, s, h = tensor.shape
                             t = min(int(self._prompt_len), int(s))
                             if t > 0:
-                                abs_act = (
-                                    tensor.detach().abs().to(torch.float32)[0, :t, :]
-                                )  # [T, H]
+                                abs_act = tensor.detach().abs().to(torch.float32)[
+                                    :, :t, :
+                                ]  # [B, T, H]
 
-                                tok_max = abs_act.max(dim=-1).values.cpu()  # [T]
+                                tok_max = abs_act.max(dim=-1).values.max(dim=0).values.cpu()  # [T]
                                 self._run_token_maxabs_by_layer.setdefault(
                                     layer_name, []
                                 ).append(tok_max)
 
-                                abs_cpu = abs_act.cpu()
+                                abs_cpu = abs_act.max(dim=0).values.cpu()  # [T, H]
                                 if (
                                     layer_name
                                     not in self._run_max_abs_token_feature_by_layer
@@ -448,7 +454,7 @@ class _AnalyzerModel(nn.Module):
                                     or self._run_hidden_dim != int(h)
                                 ):
                                     self._run_hidden_dim = int(h)
-                                    self._run_max_abs_token_feature = abs_act.cpu()
+                                    self._run_max_abs_token_feature = abs_cpu
                                     layer_idx = self._run_layer_to_index.setdefault(
                                         layer_name, len(self._run_layer_order)
                                     )
@@ -468,7 +474,7 @@ class _AnalyzerModel(nn.Module):
                                     if layer_idx == len(self._run_layer_order):
                                         self._run_layer_order.append(layer_name)
                                     prev_max = self._run_max_abs_token_feature
-                                    cur = abs_act.cpu()
+                                    cur = abs_cpu
                                     updated_max = torch.maximum(prev_max, cur)
                                     self._run_max_abs_token_feature = updated_max
                                     if (
@@ -482,20 +488,20 @@ class _AnalyzerModel(nn.Module):
 
                                 mask = abs_act >= float(
                                     self.outlier_threshold
-                                )  # [T, H]
+                                )  # [B, T, H]
                                 self._run_feature_token_count_by_layer[layer_name] = (
                                     self._run_feature_token_count_by_layer.get(
                                         layer_name, 0
                                     )
-                                    + t
+                                    + (t * int(b))
                                 )
                                 if layer_name not in self._run_feature_counts_by_layer:
                                     self._run_feature_counts_by_layer[layer_name] = (
-                                        mask.sum(dim=0).cpu()
+                                        mask.sum(dim=(0, 1)).cpu()
                                     )
                                 else:
                                     self._run_feature_counts_by_layer[layer_name] += (
-                                        mask.sum(dim=0).cpu()
+                                        mask.sum(dim=(0, 1)).cpu()
                                     )
 
                 flattened = _prepare_per_channel(tensor, mod)
@@ -626,7 +632,8 @@ class _AnalyzerModel(nn.Module):
                 if self.tokenizer is None
                 else [decode_token(self.tokenizer, i) for i in token_ids]
             )
-            fake = torch.tensor([token_ids], dtype=torch.long)
+            bsz = self._current_run_batch_size()
+            fake = torch.arange(use_len, dtype=torch.long).unsqueeze(0).repeat(bsz, 1)
             self._last_generate_outliers = self._detect_outliers_after_generate(
                 fake, prompt_len=use_len
             )
@@ -712,22 +719,27 @@ class _AnalyzerModel(nn.Module):
                 "note": "No eligible [B,S,H] activations were captured during generate().",
             }
 
+        b_min = min(t.shape[0] for t in per_layer_frac.values())
         t_min = min(t.shape[1] for t in per_layer_frac.values())
         frac_stack = torch.stack(
-            [per_layer_frac[name][:, :t_min] for name in layer_names], dim=0
+            [per_layer_frac[name][:b_min, :t_min] for name in layer_names], dim=0
         )  # [L, B, T]
 
         layer_affected = frac_stack >= self.hard_seqdim_frac  # [L, B, T]
         frac_layers_affected = layer_affected.to(torch.float32).mean(dim=0)  # [B, T]
         hard_mask = frac_layers_affected >= self.hard_layers_frac
 
-        token_ids_full = generate_result[0, :t_min].detach().cpu().tolist()
-        hard_full = hard_mask[0].detach().cpu().tolist()
+        batch_size = int(generate_result.shape[0])
+        hard_any = hard_mask.any(dim=0)  # [T]
 
         use_len = min(prompt_len, t_min) if prompt_len is not None else t_min
-        token_ids = token_ids_full[:use_len]
-        outliers_list = hard_full[:use_len]
-        decoded_tokens = [decode_token(self.tokenizer, tid) for tid in token_ids]
+        outliers_list = hard_any[:use_len].detach().cpu().tolist()
+        if batch_size == 1:
+            token_ids = generate_result[0, :t_min].detach().cpu().tolist()[:use_len]
+            decoded_tokens = [decode_token(self.tokenizer, tid) for tid in token_ids]
+        else:
+            token_ids = list(range(use_len))
+            decoded_tokens = self._sequence_position_labels(use_len)
 
         per_layer_mean: dict[str, torch.Tensor] = {}
         per_layer_var: dict[str, torch.Tensor] = {}
@@ -737,10 +749,10 @@ class _AnalyzerModel(nn.Module):
             if not mean_chunks or not var_chunks:
                 continue
             per_layer_mean[layer_name] = torch.cat(mean_chunks, dim=1)[
-                :, :t_min
+                :b_min, :t_min
             ]  # [B, T]
             per_layer_var[layer_name] = torch.cat(var_chunks, dim=1)[
-                :, :t_min
+                :b_min, :t_min
             ]  # [B, T]
 
         token_trends: dict[str, Any] | None = None
@@ -748,8 +760,12 @@ class _AnalyzerModel(nn.Module):
             means_layer_token = []
             vars_layer_token = []
             for ln in layer_names:
-                means_layer_token.append(per_layer_mean[ln][0, :use_len].cpu().tolist())
-                vars_layer_token.append(per_layer_var[ln][0, :use_len].cpu().tolist())
+                means_layer_token.append(
+                    per_layer_mean[ln][:, :use_len].mean(dim=0).cpu().tolist()
+                )
+                vars_layer_token.append(
+                    per_layer_var[ln][:, :use_len].mean(dim=0).cpu().tolist()
+                )
             token_trends = {
                 "layer_names": layer_names,
                 "token_count": int(use_len),
@@ -802,7 +818,8 @@ class _AnalyzerModel(nn.Module):
 
         token_feature_magnitude: list[list[float]] | None = None
         if self._run_max_abs_token_feature is not None and outlier_feature_dims:
-            max_abs = self._run_max_abs_token_feature[:use_len, :]  # [T, H]
+            t_feat = min(int(use_len), int(self._run_max_abs_token_feature.shape[0]))
+            max_abs = self._run_max_abs_token_feature[:t_feat, :]  # [T, H]
             token_feature_magnitude = (
                 max_abs[:, outlier_feature_dims].cpu().tolist()
             )  # [T][F]
@@ -831,8 +848,9 @@ class _AnalyzerModel(nn.Module):
         per_token_layer: list[str | None] = [None] * int(use_len)
         per_token_channel_dim: list[int | None] = [None] * int(use_len)
         if self._run_max_abs_token_feature is not None and outlier_feature_dims:
-            max_abs = self._run_max_abs_token_feature[:use_len, :]  # [T, H]
-            for ti in range(int(use_len)):
+            t_feat = min(int(use_len), int(self._run_max_abs_token_feature.shape[0]))
+            max_abs = self._run_max_abs_token_feature[:t_feat, :]  # [T, H]
+            for ti in range(int(t_feat)):
                 vals = max_abs[ti, outlier_feature_dims]
                 if vals.numel() == 0:
                     continue
