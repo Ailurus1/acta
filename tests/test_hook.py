@@ -25,7 +25,9 @@ def test_apply_hook_to_model_topology(tmp_path: Path) -> None:
 
     linear_modules = [m for m in model.model.modules() if isinstance(m, nn.Linear)]
     assert linear_modules, "Expected at least one linear module"
-    assert all(len(m._forward_hooks) > 0 for m in linear_modules), "Expected hooks on targeted modules"
+    assert all(
+        len(m._forward_hooks) > 0 for m in linear_modules
+    ), "Expected hooks on targeted modules"
 
 
 def test_hook_creates_required_output_files(tmp_path: Path) -> None:

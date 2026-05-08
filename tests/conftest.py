@@ -17,5 +17,9 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) ->
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
-    if "tests/test_analyzer.py" in item.nodeid and getattr(item.session.config, "_acta_hook_failed", False):
-        pytest.skip("Skipping analyzer tests because at least one test_hook test failed.")
+    if "tests/test_analyzer.py" in item.nodeid and getattr(
+        item.session.config, "_acta_hook_failed", False
+    ):
+        pytest.skip(
+            "Skipping analyzer tests because at least one test_hook test failed."
+        )

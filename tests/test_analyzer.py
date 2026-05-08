@@ -60,7 +60,9 @@ def _distilbert_builder() -> nn.Module:
 
 
 def _distilbert_input() -> dict[str, Any]:
-    input_ids = torch.tensor([[3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]], dtype=torch.long)
+    input_ids = torch.tensor(
+        [[3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]], dtype=torch.long
+    )
     return {
         "input_ids": input_ids,
         "attention_mask": torch.ones((1, 12), dtype=torch.long),
@@ -87,7 +89,9 @@ def _vit_builder() -> nn.Module:
 
 
 def _vit_input() -> dict[str, Any]:
-    vals = torch.linspace(-1.0, 1.0, steps=1 * 3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32)
+    vals = torch.linspace(
+        -1.0, 1.0, steps=1 * 3 * 32 * 32, dtype=torch.float32
+    ).reshape(1, 3, 32, 32)
     return {"pixel_values": vals}
 
 
@@ -113,7 +117,9 @@ def _whisper_builder() -> nn.Module:
 
 
 def _whisper_input() -> dict[str, Any]:
-    vals = torch.linspace(-0.5, 0.5, steps=1 * 80 * 128, dtype=torch.float32).reshape(1, 80, 128)
+    vals = torch.linspace(-0.5, 0.5, steps=1 * 80 * 128, dtype=torch.float32).reshape(
+        1, 80, 128
+    )
     return {"input_features": vals}
 
 
@@ -220,7 +226,9 @@ def test_multi_call_aggregated_stats_are_correct(
     )
     _ = combined
 
-    common_layers = sorted(set(stats_a["layers"]) & set(stats_b["layers"]) & set(stats_c["layers"]))
+    common_layers = sorted(
+        set(stats_a["layers"]) & set(stats_b["layers"]) & set(stats_c["layers"])
+    )
     assert common_layers, "No common layers found to validate aggregation"
     ln = common_layers[0]
 
