@@ -11,9 +11,7 @@ from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 from acta import AutoAnalyzer
 
-IMAGE_URL = (
-    "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSts3LZY5r_gDJHykCjup1i4ckZrX7Ed7TT2A&s"
-)
+IMAGE_URL = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSts3LZY5r_gDJHykCjup1i4ckZrX7Ed7TT2A&s"
 
 
 def _quiet_hf() -> None:

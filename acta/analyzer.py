@@ -9,7 +9,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Dict, Union
 
 import torch
 from torch import nn
@@ -29,7 +29,7 @@ def _to_tensor(output: Any) -> torch.Tensor | None:
     return None
 
 
-def _channel_stats(values: torch.Tensor) -> dict[str, list[float]]:
+def _channel_stats(values: torch.Tensor) -> Dict[str, Union[Dict, List[float]]]:
     if values.numel() == 0:
         return {
             "mean": [],
@@ -40,7 +40,9 @@ def _channel_stats(values: torch.Tensor) -> dict[str, list[float]]:
 
     mean = values.mean(dim=0)
     var = values.var(dim=0, unbiased=False)
-    q = torch.quantile(values, q=torch.tensor([0.25, 0.5, 0.75], device=values.device), dim=0)
+    q = torch.quantile(
+        values, q=torch.tensor([0.25, 0.5, 0.75], device=values.device), dim=0
+    )
 
     centered = values - mean
     m2 = torch.mean(centered.pow(2), dim=0)
@@ -181,7 +183,9 @@ class _AnalyzerModel(nn.Module):
         self.model = model
         self._dump_stats_path_spec = dump_stats_path
         self._session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.dump_stats_root, self.output_run_dir, self.dump_stats_path = self._resolve_versioned_dump_paths()
+        self.dump_stats_root, self.output_run_dir, self.dump_stats_path = (
+            self._resolve_versioned_dump_paths()
+        )
         self.target_layers = target_layers
         self.draw_charts = draw_charts
         self.outlier_threshold = float(outlier_threshold)
@@ -207,10 +211,14 @@ class _AnalyzerModel(nn.Module):
         self._prompt_len: int | None = None
         self._run_feature_token_count_by_layer: dict[str, int] = {}
         self._run_feature_counts_by_layer: dict[str, torch.Tensor] = {}
-        self._run_max_abs_token_feature_by_layer: dict[str, torch.Tensor] = {}  # layer -> [T_prompt, H]
+        self._run_max_abs_token_feature_by_layer: dict[
+            str, torch.Tensor
+        ] = {}  # layer -> [T_prompt, H]
         self._run_max_abs_token_feature: torch.Tensor | None = None  # [T_prompt, H]
         self._run_hidden_dim: int | None = None
-        self._run_argmax_layer_per_token_feature: torch.Tensor | None = None  # [T_prompt, H] int32
+        self._run_argmax_layer_per_token_feature: torch.Tensor | None = (
+            None  # [T_prompt, H] int32
+        )
         self._run_layer_order: list[str] = []
         self._run_layer_to_index: dict[str, int] = {}
         self._run_token_maxabs_by_layer: dict[str, list[torch.Tensor]] = {}
@@ -270,8 +278,12 @@ class _AnalyzerModel(nn.Module):
                         "idx": i,
                         "token": tok,
                         "token_id": tids[i] if i < len(tids) else "",
-                        "layer": layers[i] if i < len(layers) and layers[i] is not None else "",
-                        "channel_dim": dims[i] if i < len(dims) and dims[i] is not None else "",
+                        "layer": layers[i]
+                        if i < len(layers) and layers[i] is not None
+                        else "",
+                        "channel_dim": dims[i]
+                        if i < len(dims) and dims[i] is not None
+                        else "",
                         "outliers": outlier_flags[i] if i < len(outlier_flags) else "",
                     }
                 )
@@ -330,10 +342,16 @@ class _AnalyzerModel(nn.Module):
         if self.target_layers is None:
             return True
 
-        patterns = self.target_layers if isinstance(self.target_layers, list) else [self.target_layers]
+        patterns = (
+            self.target_layers
+            if isinstance(self.target_layers, list)
+            else [self.target_layers]
+        )
         class_name = module.__class__.__name__
         for pattern in patterns:
-            if fnmatch.fnmatchcase(layer_name, pattern) or fnmatch.fnmatchcase(class_name, pattern):
+            if fnmatch.fnmatchcase(layer_name, pattern) or fnmatch.fnmatchcase(
+                class_name, pattern
+            ):
                 return True
 
             try:
@@ -357,7 +375,12 @@ class _AnalyzerModel(nn.Module):
                 if not self._layer_is_targeted(name, module):
                     continue
 
-            def _hook_fn(mod: nn.Module, inputs: tuple[Any, ...], output: Any, layer_name: str = name) -> None:
+            def _hook_fn(
+                mod: nn.Module,
+                inputs: tuple[Any, ...],
+                output: Any,
+                layer_name: str = name,
+            ) -> None:
                 tensor = _to_tensor(output)
                 if tensor is None:
                     return
@@ -366,62 +389,114 @@ class _AnalyzerModel(nn.Module):
 
                 if self._in_generate:
                     self._maybe_set_prompt_len_from_tensor(tensor)
-                    frac = _token_outlier_fraction(tensor, threshold=self.outlier_threshold)
+                    frac = _token_outlier_fraction(
+                        tensor, threshold=self.outlier_threshold
+                    )
                     if frac is not None:
-                        self._run_token_frac_by_layer.setdefault(layer_name, []).append(frac.cpu())
-                        token_mean = tensor.detach().to(torch.float32).mean(dim=-1)  # [B, S]
-                        token_var = tensor.detach().to(torch.float32).var(dim=-1, unbiased=False)  # [B, S]
-                        self._run_token_mean_by_layer.setdefault(layer_name, []).append(token_mean.cpu())
-                        self._run_token_var_by_layer.setdefault(layer_name, []).append(token_var.cpu())
+                        self._run_token_frac_by_layer.setdefault(layer_name, []).append(
+                            frac.cpu()
+                        )
+                        token_mean = (
+                            tensor.detach().to(torch.float32).mean(dim=-1)
+                        )  # [B, S]
+                        token_var = (
+                            tensor.detach()
+                            .to(torch.float32)
+                            .var(dim=-1, unbiased=False)
+                        )  # [B, S]
+                        self._run_token_mean_by_layer.setdefault(layer_name, []).append(
+                            token_mean.cpu()
+                        )
+                        self._run_token_var_by_layer.setdefault(layer_name, []).append(
+                            token_var.cpu()
+                        )
 
                         if tensor.ndim == 3 and self._prompt_len is not None:
                             b, s, h = tensor.shape
                             t = min(int(self._prompt_len), int(s))
                             if t > 0:
-                                abs_act = tensor.detach().abs().to(torch.float32)[0, :t, :]  # [T, H]
+                                abs_act = (
+                                    tensor.detach().abs().to(torch.float32)[0, :t, :]
+                                )  # [T, H]
 
                                 tok_max = abs_act.max(dim=-1).values.cpu()  # [T]
-                                self._run_token_maxabs_by_layer.setdefault(layer_name, []).append(tok_max)
+                                self._run_token_maxabs_by_layer.setdefault(
+                                    layer_name, []
+                                ).append(tok_max)
 
                                 abs_cpu = abs_act.cpu()
-                                if layer_name not in self._run_max_abs_token_feature_by_layer:
-                                    self._run_max_abs_token_feature_by_layer[layer_name] = abs_cpu
+                                if (
+                                    layer_name
+                                    not in self._run_max_abs_token_feature_by_layer
+                                ):
+                                    self._run_max_abs_token_feature_by_layer[
+                                        layer_name
+                                    ] = abs_cpu
                                 else:
-                                    prev_layer = self._run_max_abs_token_feature_by_layer[layer_name]
+                                    prev_layer = (
+                                        self._run_max_abs_token_feature_by_layer[
+                                            layer_name
+                                        ]
+                                    )
                                     if prev_layer.shape == abs_cpu.shape:
-                                        self._run_max_abs_token_feature_by_layer[layer_name] = torch.maximum(prev_layer, abs_cpu)
+                                        self._run_max_abs_token_feature_by_layer[
+                                            layer_name
+                                        ] = torch.maximum(prev_layer, abs_cpu)
 
-                                if self._run_max_abs_token_feature is None or self._run_hidden_dim != int(h):
+                                if (
+                                    self._run_max_abs_token_feature is None
+                                    or self._run_hidden_dim != int(h)
+                                ):
                                     self._run_hidden_dim = int(h)
                                     self._run_max_abs_token_feature = abs_act.cpu()
-                                    layer_idx = self._run_layer_to_index.setdefault(layer_name, len(self._run_layer_order))
+                                    layer_idx = self._run_layer_to_index.setdefault(
+                                        layer_name, len(self._run_layer_order)
+                                    )
                                     if layer_idx == len(self._run_layer_order):
                                         self._run_layer_order.append(layer_name)
-                                    self._run_argmax_layer_per_token_feature = torch.full(
-                                        (t, int(h)),
-                                        int(layer_idx),
-                                        dtype=torch.int32,
+                                    self._run_argmax_layer_per_token_feature = (
+                                        torch.full(
+                                            (t, int(h)),
+                                            int(layer_idx),
+                                            dtype=torch.int32,
+                                        )
                                     )
                                 else:
-                                    layer_idx = self._run_layer_to_index.setdefault(layer_name, len(self._run_layer_order))
+                                    layer_idx = self._run_layer_to_index.setdefault(
+                                        layer_name, len(self._run_layer_order)
+                                    )
                                     if layer_idx == len(self._run_layer_order):
                                         self._run_layer_order.append(layer_name)
                                     prev_max = self._run_max_abs_token_feature
                                     cur = abs_act.cpu()
                                     updated_max = torch.maximum(prev_max, cur)
                                     self._run_max_abs_token_feature = updated_max
-                                    if self._run_argmax_layer_per_token_feature is not None:
+                                    if (
+                                        self._run_argmax_layer_per_token_feature
+                                        is not None
+                                    ):
                                         upd = cur > prev_max
-                                        self._run_argmax_layer_per_token_feature[upd] = int(layer_idx)
+                                        self._run_argmax_layer_per_token_feature[
+                                            upd
+                                        ] = int(layer_idx)
 
-                                mask = abs_act >= float(self.outlier_threshold)  # [T, H]
+                                mask = abs_act >= float(
+                                    self.outlier_threshold
+                                )  # [T, H]
                                 self._run_feature_token_count_by_layer[layer_name] = (
-                                    self._run_feature_token_count_by_layer.get(layer_name, 0) + t
+                                    self._run_feature_token_count_by_layer.get(
+                                        layer_name, 0
+                                    )
+                                    + t
                                 )
                                 if layer_name not in self._run_feature_counts_by_layer:
-                                    self._run_feature_counts_by_layer[layer_name] = mask.sum(dim=0).cpu()
+                                    self._run_feature_counts_by_layer[layer_name] = (
+                                        mask.sum(dim=0).cpu()
+                                    )
                                 else:
-                                    self._run_feature_counts_by_layer[layer_name] += mask.sum(dim=0).cpu()
+                                    self._run_feature_counts_by_layer[layer_name] += (
+                                        mask.sum(dim=0).cpu()
+                                    )
 
                 flattened = _prepare_per_channel(tensor, mod)
                 self._layer_values.setdefault(layer_name, []).append(flattened.cpu())
@@ -433,7 +508,9 @@ class _AnalyzerModel(nn.Module):
         self._layer_values.clear()
 
     def _build_stats(self) -> dict[str, Any]:
-        self._log(f"aggregating activation statistics from {len(self._layer_values)} layers")
+        self._log(
+            f"aggregating activation statistics from {len(self._layer_values)} layers"
+        )
         layers: dict[str, Any] = {}
         for layer_name, chunks in self._layer_values.items():
             if not chunks:
@@ -473,10 +550,17 @@ class _AnalyzerModel(nn.Module):
         run_flags = _pad(run_flags, False, n)
         merged_flags = [a or b for a, b in zip(agg_flags, run_flags, strict=False)]
         agg["outliers"] = merged_flags
-        agg["token_count"] = int(max(int(agg.get("token_count", 0)), int(run_outliers.get("token_count", 0))))
+        agg["token_count"] = int(
+            max(int(agg.get("token_count", 0)), int(run_outliers.get("token_count", 0)))
+        )
         self._log(f"aggregated outliers across calls (tokens={n})")
 
-        for key, fill in (("prompt_tokens", ""), ("prompt_token_ids", ""), ("per_token_layer", None), ("per_token_channel_dim", None)):
+        for key, fill in (
+            ("prompt_tokens", ""),
+            ("prompt_token_ids", ""),
+            ("per_token_layer", None),
+            ("per_token_channel_dim", None),
+        ):
             agg_vals = _pad(list(agg.get(key, [])), fill, n)
             run_vals = _pad(list(run_outliers.get(key, [])), fill, n)
             merged_vals: list[Any] = []
@@ -501,7 +585,9 @@ class _AnalyzerModel(nn.Module):
     def _dump_stats(self, draw_charts: bool = False) -> None:
         stats = self._build_stats()
         if self._aggregate_generate_outliers is not None:
-            self._aggregate_generate_outliers["chart_3d_max_tokens"] = self.chart_3d_max_tokens
+            self._aggregate_generate_outliers["chart_3d_max_tokens"] = (
+                self.chart_3d_max_tokens
+            )
             stats["outliers"] = self._aggregate_generate_outliers
         stats["_acta"] = {
             "dump_stats_root": self.dump_stats_root.as_posix(),
@@ -541,23 +627,35 @@ class _AnalyzerModel(nn.Module):
                 else [decode_token(self.tokenizer, i) for i in token_ids]
             )
             fake = torch.tensor([token_ids], dtype=torch.long)
-            self._last_generate_outliers = self._detect_outliers_after_generate(fake, prompt_len=use_len)
+            self._last_generate_outliers = self._detect_outliers_after_generate(
+                fake, prompt_len=use_len
+            )
             if self._last_generate_outliers is not None:
                 self._last_generate_outliers["prompt_token_ids"] = token_ids
                 self._last_generate_outliers["prompt_tokens"] = decoded
-                if "token_trends" in self._last_generate_outliers and isinstance(self._last_generate_outliers["token_trends"], dict):
+                if "token_trends" in self._last_generate_outliers and isinstance(
+                    self._last_generate_outliers["token_trends"], dict
+                ):
                     self._last_generate_outliers["token_trends"]["tokens"] = decoded
-                    self._last_generate_outliers["token_trends"]["token_ids"] = token_ids
+                    self._last_generate_outliers["token_trends"]["token_ids"] = (
+                        token_ids
+                    )
                 if "outliers" in self._last_generate_outliers:
                     outlier_flags = self._last_generate_outliers.get("outliers", [])
-                    layers = self._last_generate_outliers.get("per_token_layer", [None] * len(decoded))
-                    dims = self._last_generate_outliers.get("per_token_channel_dim", [None] * len(decoded))
-                    self._last_generate_outliers["table"] = _format_outlier_table_decoded(
-                        tokens=decoded,
-                        token_ids=token_ids,
-                        outliers=outlier_flags,
-                        layers=layers,
-                        channel_dims=dims,
+                    layers = self._last_generate_outliers.get(
+                        "per_token_layer", [None] * len(decoded)
+                    )
+                    dims = self._last_generate_outliers.get(
+                        "per_token_channel_dim", [None] * len(decoded)
+                    )
+                    self._last_generate_outliers["table"] = (
+                        _format_outlier_table_decoded(
+                            tokens=decoded,
+                            token_ids=token_ids,
+                            outliers=outlier_flags,
+                            layers=layers,
+                            channel_dims=dims,
+                        )
                     )
 
         self._merge_outliers_across_calls(self._last_generate_outliers)
@@ -580,15 +678,23 @@ class _AnalyzerModel(nn.Module):
         finally:
             self._in_generate = False
 
-        if isinstance(result, torch.Tensor) and result.ndim == 2 and prompt_len is not None:
+        if (
+            isinstance(result, torch.Tensor)
+            and result.ndim == 2
+            and prompt_len is not None
+        ):
             self._last_prompt_token_ids = result[0, :prompt_len].detach().cpu().tolist()
 
-        self._last_generate_outliers = self._detect_outliers_after_generate(result, prompt_len=prompt_len)
+        self._last_generate_outliers = self._detect_outliers_after_generate(
+            result, prompt_len=prompt_len
+        )
         self._merge_outliers_across_calls(self._last_generate_outliers)
         self._dump_stats(draw_charts=False)
         return result
 
-    def _detect_outliers_after_generate(self, generate_result: Any, prompt_len: int | None) -> dict[str, Any] | None:
+    def _detect_outliers_after_generate(
+        self, generate_result: Any, prompt_len: int | None
+    ) -> dict[str, Any] | None:
         if not isinstance(generate_result, torch.Tensor) or generate_result.ndim != 2:
             return None
 
@@ -607,7 +713,9 @@ class _AnalyzerModel(nn.Module):
             }
 
         t_min = min(t.shape[1] for t in per_layer_frac.values())
-        frac_stack = torch.stack([per_layer_frac[name][:, :t_min] for name in layer_names], dim=0)  # [L, B, T]
+        frac_stack = torch.stack(
+            [per_layer_frac[name][:, :t_min] for name in layer_names], dim=0
+        )  # [L, B, T]
 
         layer_affected = frac_stack >= self.hard_seqdim_frac  # [L, B, T]
         frac_layers_affected = layer_affected.to(torch.float32).mean(dim=0)  # [B, T]
@@ -628,8 +736,12 @@ class _AnalyzerModel(nn.Module):
             var_chunks = self._run_token_var_by_layer.get(layer_name, [])
             if not mean_chunks or not var_chunks:
                 continue
-            per_layer_mean[layer_name] = torch.cat(mean_chunks, dim=1)[:, :t_min]  # [B, T]
-            per_layer_var[layer_name] = torch.cat(var_chunks, dim=1)[:, :t_min]  # [B, T]
+            per_layer_mean[layer_name] = torch.cat(mean_chunks, dim=1)[
+                :, :t_min
+            ]  # [B, T]
+            per_layer_var[layer_name] = torch.cat(var_chunks, dim=1)[
+                :, :t_min
+            ]  # [B, T]
 
         token_trends: dict[str, Any] | None = None
         if len(per_layer_mean) == len(layer_names):
@@ -651,34 +763,59 @@ class _AnalyzerModel(nn.Module):
         outlier_feature_dims: list[int] = []
         h_shared: int | None = None
         if self._run_feature_counts_by_layer and self._run_feature_token_count_by_layer:
-            eligible_layers = [ln for ln in layer_names if ln in self._run_feature_counts_by_layer]
+            eligible_layers = [
+                ln for ln in layer_names if ln in self._run_feature_counts_by_layer
+            ]
             if eligible_layers:
-                lengths = [int(self._run_feature_counts_by_layer[ln].shape[0]) for ln in eligible_layers]
+                lengths = [
+                    int(self._run_feature_counts_by_layer[ln].shape[0])
+                    for ln in eligible_layers
+                ]
                 h = int(max(set(lengths), key=lengths.count))
-                eligible_layers = [ln for ln in eligible_layers if int(self._run_feature_counts_by_layer[ln].shape[0]) == h]
+                eligible_layers = [
+                    ln
+                    for ln in eligible_layers
+                    if int(self._run_feature_counts_by_layer[ln].shape[0]) == h
+                ]
                 h_shared = h
                 affected_layers_per_dim = torch.zeros(h, dtype=torch.float32)
                 num_layers = len(eligible_layers)
                 if num_layers > 0:
                     for ln in eligible_layers:
-                        total_toks = max(int(self._run_feature_token_count_by_layer.get(ln, 0)), 1)
-                        frac_tokens = self._run_feature_counts_by_layer[ln].to(torch.float32) / float(total_toks)
-                        affected_layers_per_dim += (frac_tokens >= float(self.hard_seqdim_frac)).to(torch.float32)
+                        total_toks = max(
+                            int(self._run_feature_token_count_by_layer.get(ln, 0)), 1
+                        )
+                        frac_tokens = self._run_feature_counts_by_layer[ln].to(
+                            torch.float32
+                        ) / float(total_toks)
+                        affected_layers_per_dim += (
+                            frac_tokens >= float(self.hard_seqdim_frac)
+                        ).to(torch.float32)
                     frac_layers = affected_layers_per_dim / float(num_layers)
                     outlier_feature_dims = (
-                        (frac_layers >= float(self.hard_layers_frac)).nonzero(as_tuple=False).view(-1).cpu().tolist()
+                        (frac_layers >= float(self.hard_layers_frac))
+                        .nonzero(as_tuple=False)
+                        .view(-1)
+                        .cpu()
+                        .tolist()
                     )
 
         token_feature_magnitude: list[list[float]] | None = None
         if self._run_max_abs_token_feature is not None and outlier_feature_dims:
             max_abs = self._run_max_abs_token_feature[:use_len, :]  # [T, H]
-            token_feature_magnitude = max_abs[:, outlier_feature_dims].cpu().tolist()  # [T][F]
+            token_feature_magnitude = (
+                max_abs[:, outlier_feature_dims].cpu().tolist()
+            )  # [T][F]
 
         token_feature_magnitude_by_layer: dict[str, list[list[float]]] = {}
         h_for_slices = h_shared
         if h_for_slices is None and self._run_max_abs_token_feature is not None:
             h_for_slices = int(self._run_max_abs_token_feature.shape[1])
-        if outlier_feature_dims and self._run_max_abs_token_feature_by_layer and h_for_slices is not None:
+        if (
+            outlier_feature_dims
+            and self._run_max_abs_token_feature_by_layer
+            and h_for_slices is not None
+        ):
             for ln, ten in self._run_max_abs_token_feature_by_layer.items():
                 if ten.ndim != 2:
                     continue
@@ -687,7 +824,9 @@ class _AnalyzerModel(nn.Module):
                 t_use = min(int(use_len), int(ten.shape[0]))
                 if t_use <= 0:
                     continue
-                token_feature_magnitude_by_layer[ln] = ten[:t_use, outlier_feature_dims].cpu().tolist()
+                token_feature_magnitude_by_layer[ln] = (
+                    ten[:t_use, outlier_feature_dims].cpu().tolist()
+                )
 
         per_token_layer: list[str | None] = [None] * int(use_len)
         per_token_channel_dim: list[int | None] = [None] * int(use_len)
@@ -699,19 +838,31 @@ class _AnalyzerModel(nn.Module):
                     continue
                 j = int(torch.argmax(vals).item())
                 per_token_channel_dim[ti] = int(outlier_feature_dims[j])
-                if self._run_argmax_layer_per_token_feature is not None and self._run_layer_order:
-                    li = int(self._run_argmax_layer_per_token_feature[ti, per_token_channel_dim[ti]].item())
+                if (
+                    self._run_argmax_layer_per_token_feature is not None
+                    and self._run_layer_order
+                ):
+                    li = int(
+                        self._run_argmax_layer_per_token_feature[
+                            ti, per_token_channel_dim[ti]
+                        ].item()
+                    )
                     if 0 <= li < len(self._run_layer_order):
                         per_token_layer[ti] = self._run_layer_order[li]
 
         token_layer_max_magnitude: list[list[float]] | None = None
         if self._run_token_maxabs_by_layer:
             layer_list = sorted(self._run_token_maxabs_by_layer.keys())
-            t_layer_min = min(torch.cat(chunks, dim=0).shape[0] for chunks in self._run_token_maxabs_by_layer.values())
+            t_layer_min = min(
+                torch.cat(chunks, dim=0).shape[0]
+                for chunks in self._run_token_maxabs_by_layer.values()
+            )
             t_layer_use = min(int(use_len), int(t_layer_min))
             token_layer_max_magnitude = []
             for ln in layer_list:
-                seq = torch.cat(self._run_token_maxabs_by_layer[ln], dim=0)[:t_layer_use]  # [T]
+                seq = torch.cat(self._run_token_maxabs_by_layer[ln], dim=0)[
+                    :t_layer_use
+                ]  # [T]
                 token_layer_max_magnitude.append(seq.cpu().tolist())
 
         return {
@@ -745,7 +896,7 @@ class _AnalyzerModel(nn.Module):
                 "token_ids": token_ids,
                 # shape: [num_layers][token_count]
                 "max_abs": token_layer_max_magnitude,
-            }
+            },
         }
 
     def __getattr__(self, item: str) -> Any:
