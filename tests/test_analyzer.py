@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Callable
+
+import pytest
+import torch
+from torch import nn
+from transformers import (
+    DistilBertConfig,
+    DistilBertModel,
+    GPT2Config,
+    GPT2LMHeadModel,
+    ViTConfig,
+    ViTForImageClassification,
+    WhisperConfig,
+    WhisperForConditionalGeneration,
+)
+
+from acta import AutoAnalyzer
+
+ModelBuilder = Callable[[], nn.Module]
+InputBuilder = Callable[[], dict[str, Any]]
+RunFn = Callable[[nn.Module, dict[str, Any]], Any]
+
+
+def _gpt2_builder() -> nn.Module:
+    cfg = GPT2Config(
+        vocab_size=64,
+        n_positions=32,
+        n_layer=2,
+        n_head=2,
+        n_embd=32,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    return GPT2LMHeadModel(cfg).eval()
+
+
+def _gpt2_input() -> dict[str, Any]:
+    return {"input_ids": torch.tensor([[1, 5, 7, 9, 11, 2]], dtype=torch.long)}
+
+
+def _gpt2_run(model: nn.Module, inp: dict[str, Any]) -> Any:
+    with torch.no_grad():
+        return model.generate(**inp, max_new_tokens=3)
+
+
+def _distilbert_builder() -> nn.Module:
+    cfg = DistilBertConfig(
+        vocab_size=100,
+        max_position_embeddings=64,
+        n_layers=2,
+        n_heads=4,
+        dim=32,
+        hidden_dim=64,
+    )
+    return DistilBertModel(cfg).eval()
+
+
+def _distilbert_input() -> dict[str, Any]:
+    input_ids = torch.tensor([[3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]], dtype=torch.long)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones((1, 12), dtype=torch.long),
+    }
+
+
+def _forward_run(model: nn.Module, inp: dict[str, Any]) -> Any:
+    with torch.no_grad():
+        return model(**inp)
+
+
+def _vit_builder() -> nn.Module:
+    cfg = ViTConfig(
+        image_size=32,
+        patch_size=16,
+        num_channels=3,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        intermediate_size=64,
+        num_labels=2,
+    )
+    return ViTForImageClassification(cfg).eval()
+
+
+def _vit_input() -> dict[str, Any]:
+    vals = torch.linspace(-1.0, 1.0, steps=1 * 3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32)
+    return {"pixel_values": vals}
+
+
+def _whisper_builder() -> nn.Module:
+    cfg = WhisperConfig(
+        vocab_size=64,
+        d_model=32,
+        encoder_layers=2,
+        decoder_layers=2,
+        encoder_attention_heads=4,
+        decoder_attention_heads=4,
+        encoder_ffn_dim=64,
+        decoder_ffn_dim=64,
+        num_mel_bins=80,
+        max_source_positions=64,
+        max_target_positions=64,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        decoder_start_token_id=1,
+    )
+    return WhisperForConditionalGeneration(cfg).get_encoder().eval()
+
+
+def _whisper_input() -> dict[str, Any]:
+    vals = torch.linspace(-0.5, 0.5, steps=1 * 80 * 128, dtype=torch.float32).reshape(1, 80, 128)
+    return {"input_features": vals}
+
+
+CASES: list[tuple[str, ModelBuilder, InputBuilder, RunFn]] = [
+    ("gpt2", _gpt2_builder, _gpt2_input, _gpt2_run),
+    ("whisper_tiny", _whisper_builder, _whisper_input, _forward_run),
+    ("distilbert", _distilbert_builder, _distilbert_input, _forward_run),
+    ("vit", _vit_builder, _vit_input, _forward_run),
+]
+
+
+def _read_stats(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_case(
+    tmp_path: Path,
+    case_name: str,
+    model_builder: ModelBuilder,
+    input_builder: InputBuilder,
+    run_fn: RunFn,
+    *,
+    draw_charts: bool,
+    num_calls: int = 1,
+) -> tuple[nn.Module, dict[str, Any]]:
+    torch.manual_seed(42)
+    wrapped = AutoAnalyzer(
+        model_builder(),
+        dump_stats_path=str(tmp_path / case_name),
+        target_layers=None,
+        draw_charts=draw_charts,
+        verbose=False,
+        tokenizer=None,
+        outlier_threshold=0.0,
+    )
+    wrapped.eval()
+    for _ in range(num_calls):
+        run_fn(wrapped, input_builder())
+    return wrapped, _read_stats(Path(wrapped.dump_stats_path))
+
+
+@pytest.mark.parametrize("case_name,model_builder,input_builder,run_fn", CASES)
+def test_eval_models_create_required_artifacts_no_charts(
+    tmp_path: Path,
+    case_name: str,
+    model_builder: ModelBuilder,
+    input_builder: InputBuilder,
+    run_fn: RunFn,
+) -> None:
+    wrapped, stats = _run_case(
+        tmp_path,
+        case_name,
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=False,
+        num_calls=1,
+    )
+    run_dir = Path(wrapped.output_run_dir)
+
+    assert run_dir.exists()
+    assert Path(wrapped.dump_stats_path).exists()
+    assert (run_dir / "acta_results.csv").exists()
+    assert "layers" in stats and stats["layers"]
+    assert not list(run_dir.rglob("*.png"))
+
+
+@pytest.mark.parametrize("case_name,model_builder,input_builder,run_fn", CASES)
+def test_multi_call_aggregated_stats_are_correct(
+    tmp_path: Path,
+    case_name: str,
+    model_builder: ModelBuilder,
+    input_builder: InputBuilder,
+    run_fn: RunFn,
+) -> None:
+    base_a, stats_a = _run_case(
+        tmp_path / "a",
+        case_name,
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=False,
+        num_calls=1,
+    )
+    _ = base_a
+    base_b, stats_b = _run_case(
+        tmp_path / "b",
+        case_name,
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=False,
+        num_calls=1,
+    )
+    _ = base_b
+    combined, stats_c = _run_case(
+        tmp_path / "combined",
+        case_name,
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=False,
+        num_calls=2,
+    )
+    _ = combined
+
+    common_layers = sorted(set(stats_a["layers"]) & set(stats_b["layers"]) & set(stats_c["layers"]))
+    assert common_layers, "No common layers found to validate aggregation"
+    ln = common_layers[0]
+
+    n1 = int(stats_a["layers"][ln]["num_observations"])
+    n2 = int(stats_b["layers"][ln]["num_observations"])
+    n3 = int(stats_c["layers"][ln]["num_observations"])
+    assert n3 == n1 + n2
+
+    m1 = torch.tensor(stats_a["layers"][ln]["mean"], dtype=torch.float32)
+    m2 = torch.tensor(stats_b["layers"][ln]["mean"], dtype=torch.float32)
+    m3 = torch.tensor(stats_c["layers"][ln]["mean"], dtype=torch.float32)
+    expected = (m1 * n1 + m2 * n2) / float(n1 + n2)
+    assert torch.allclose(m3, expected, atol=1e-5, rtol=1e-4)
+
+    out_a = [bool(v) for v in stats_a.get("outliers", {}).get("outliers", [])]
+    out_b = [bool(v) for v in stats_b.get("outliers", {}).get("outliers", [])]
+    out_c = [bool(v) for v in stats_c.get("outliers", {}).get("outliers", [])]
+    if out_c:
+        max_len = max(len(out_a), len(out_b), len(out_c))
+        out_a += [False] * (max_len - len(out_a))
+        out_b += [False] * (max_len - len(out_b))
+        out_c += [False] * (max_len - len(out_c))
+        expected_or = [a or b for a, b in zip(out_a, out_b, strict=False)]
+        assert out_c == expected_or
+
+
+@pytest.mark.parametrize("case_name,model_builder,input_builder,run_fn", CASES)
+def test_eval_models_create_all_charts(
+    tmp_path: Path,
+    case_name: str,
+    model_builder: ModelBuilder,
+    input_builder: InputBuilder,
+    run_fn: RunFn,
+) -> None:
+    wrapped, _stats = _run_case(
+        tmp_path,
+        f"{case_name}_charts",
+        model_builder,
+        input_builder,
+        run_fn,
+        draw_charts=True,
+        num_calls=1,
+    )
+    wrapped._finalize_on_exit()
+    run_dir = Path(wrapped.output_run_dir)
+
+    assert (run_dir / "layer_channel_hist").exists()
+    assert list((run_dir / "layer_channel_hist").glob("*.png"))
+    assert (run_dir / "token_trends").exists()
+    assert list((run_dir / "token_trends").glob("*.png"))
+    assert (run_dir / "outlier_token_feature_3d.png").exists()
+    assert (run_dir / "token_layer_maxabs_3d.png").exists()
+    assert (run_dir / "outlier_token_feature_3d_per_layer").exists()
+    assert list((run_dir / "outlier_token_feature_3d_per_layer").glob("*.png"))
