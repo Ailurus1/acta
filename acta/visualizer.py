@@ -404,6 +404,10 @@ def build_charts_from_stats_file(
     with open(stats_file, "r", encoding="utf-8") as f:
         stats = json.load(f)
 
-    out_dir = Path(output_dir).expanduser().resolve() if output_dir is not None else stats_file.parent
+    out_dir = (
+        Path(output_dir).expanduser().resolve()
+        if output_dir is not None
+        else stats_file.parent
+    )
     draw_activation_charts(stats=stats, output_dir=out_dir.as_posix())
     return out_dir

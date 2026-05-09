@@ -157,9 +157,9 @@ def _whisper_input() -> dict[str, Any]:
 
 
 def _whisper_batched_input() -> dict[str, Any]:
-    vals = torch.linspace(
-        -0.5, 0.5, steps=2 * 80 * 128, dtype=torch.float32
-    ).reshape(2, 80, 128)
+    vals = torch.linspace(-0.5, 0.5, steps=2 * 80 * 128, dtype=torch.float32).reshape(
+        2, 80, 128
+    )
     return {"input_features": vals}
 
 

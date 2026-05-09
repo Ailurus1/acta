@@ -19,6 +19,13 @@ from .visualizer import draw_activation_charts
 logger = logging.getLogger("acta.analyzer")
 
 
+def _maybe_release_accelerator_memory() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
 def _to_tensor(output: Any) -> torch.Tensor | None:
     if isinstance(output, torch.Tensor):
         return output
@@ -38,27 +45,35 @@ def _channel_stats(values: torch.Tensor) -> Dict[str, Union[Dict, List[float]]]:
             "kurtosis": [],
         }
 
-    mean = values.mean(dim=0)
-    var = values.var(dim=0, unbiased=False)
-    q = torch.quantile(
-        values, q=torch.tensor([0.25, 0.5, 0.75], device=values.device), dim=0
-    )
+    with torch.no_grad():
+        mean = values.mean(dim=0)
+        var = values.var(dim=0, unbiased=False)
+        q = torch.quantile(
+            values,
+            q=torch.tensor([0.25, 0.5, 0.75], device=values.device, dtype=values.dtype),
+            dim=0,
+        )
 
-    centered = values - mean
-    m2 = torch.mean(centered.pow(2), dim=0)
-    m4 = torch.mean(centered.pow(4), dim=0)
-    eps = torch.finfo(values.dtype).eps
-    kurtosis = m4 / (m2.pow(2) + eps)
+        centered = values - mean
+        m2 = torch.mean(centered.pow(2), dim=0)
+        m4 = torch.mean(centered.pow(4), dim=0)
+        eps = torch.finfo(values.dtype).eps
+        kurtosis = m4 / (m2.pow(2) + eps)
+
+        out_mean = mean.cpu().tolist()
+        out_var = var.cpu().tolist()
+        out_q25 = q[0].cpu().tolist()
+        out_q50 = q[1].cpu().tolist()
+        out_q75 = q[2].cpu().tolist()
+        out_kurt = kurtosis.cpu().tolist()
+
+        del mean, var, q, centered, m2, m4, kurtosis
 
     return {
-        "mean": mean.cpu().tolist(),
-        "variance": var.cpu().tolist(),
-        "quantiles": {
-            "q25": q[0].cpu().tolist(),
-            "q50": q[1].cpu().tolist(),
-            "q75": q[2].cpu().tolist(),
-        },
-        "kurtosis": kurtosis.cpu().tolist(),
+        "mean": out_mean,
+        "variance": out_var,
+        "quantiles": {"q25": out_q25, "q50": out_q50, "q75": out_q75},
+        "kurtosis": out_kurt,
     }
 
 
@@ -395,21 +410,16 @@ class _AnalyzerModel(nn.Module):
 
                 if self._in_generate:
                     self._maybe_set_prompt_len_from_tensor(tensor)
+                    t_float = tensor.detach().float()
                     frac = _token_outlier_fraction(
-                        tensor, threshold=self.outlier_threshold
+                        t_float, threshold=self.outlier_threshold
                     )
                     if frac is not None:
                         self._run_token_frac_by_layer.setdefault(layer_name, []).append(
                             frac.cpu()
                         )
-                        token_mean = (
-                            tensor.detach().to(torch.float32).mean(dim=-1)
-                        )  # [B, S]
-                        token_var = (
-                            tensor.detach()
-                            .to(torch.float32)
-                            .var(dim=-1, unbiased=False)
-                        )  # [B, S]
+                        token_mean = t_float.mean(dim=-1)  # [B, S]
+                        token_var = t_float.var(dim=-1, unbiased=False)  # [B, S]
                         self._run_token_mean_by_layer.setdefault(layer_name, []).append(
                             token_mean.cpu()
                         )
@@ -421,11 +431,11 @@ class _AnalyzerModel(nn.Module):
                             b, s, h = tensor.shape
                             t = min(int(self._prompt_len), int(s))
                             if t > 0:
-                                abs_act = tensor.detach().abs().to(torch.float32)[
-                                    :, :t, :
-                                ]  # [B, T, H]
+                                abs_act = t_float[:, :t, :]  # [B, T, H]
 
-                                tok_max = abs_act.max(dim=-1).values.max(dim=0).values.cpu()  # [T]
+                                tok_max = (
+                                    abs_act.max(dim=-1).values.max(dim=0).values.cpu()
+                                )  # [T]
                                 self._run_token_maxabs_by_layer.setdefault(
                                     layer_name, []
                                 ).append(tok_max)
@@ -504,13 +514,20 @@ class _AnalyzerModel(nn.Module):
                                         mask.sum(dim=(0, 1)).cpu()
                                     )
 
-                flattened = _prepare_per_channel(tensor, mod)
-                self._layer_values.setdefault(layer_name, []).append(flattened.cpu())
+                                del abs_act, mask
+
+                    del t_float
+
+                cpu_flat_in = tensor.detach().float().cpu()
+                flattened = _prepare_per_channel(cpu_flat_in, mod)
+                del cpu_flat_in
+                self._layer_values.setdefault(layer_name, []).append(flattened)
 
             self._hooks.append(module.register_forward_hook(_hook_fn))
             self._log(f"hook registered for layer: {name}")
 
     def reset_stats(self) -> None:
+        """Drop accumulated per-layer activation chunks (CPU tensors). Call between runs to free RAM."""
         self._layer_values.clear()
 
     def _build_stats(self) -> dict[str, Any]:
@@ -525,6 +542,7 @@ class _AnalyzerModel(nn.Module):
             layer_stats = _channel_stats(data)
             layer_stats["num_observations"] = data.shape[0]
             layers[layer_name] = layer_stats
+            del data
         return {"layers": layers}
 
     def _finalize_on_exit(self) -> None:
@@ -610,6 +628,8 @@ class _AnalyzerModel(nn.Module):
             self._log(f"creating charts in: {chart_dir.as_posix()}")
             draw_activation_charts(stats=stats, output_dir=chart_dir.as_posix())
         self._final_dump_done = bool(draw_charts)
+        del stats
+        _maybe_release_accelerator_memory()
 
     def _run_and_dump(self, runner: Any, *args: Any, **kwargs: Any) -> Any:
         result = runner(*args, **kwargs)
@@ -666,6 +686,7 @@ class _AnalyzerModel(nn.Module):
                     )
 
         self._merge_outliers_across_calls(self._last_generate_outliers)
+        self._last_generate_outliers = None
         self._dump_stats(draw_charts=False)
         return result
 
@@ -696,6 +717,7 @@ class _AnalyzerModel(nn.Module):
             result, prompt_len=prompt_len
         )
         self._merge_outliers_across_calls(self._last_generate_outliers)
+        self._last_generate_outliers = None
         self._dump_stats(draw_charts=False)
         return result
 
