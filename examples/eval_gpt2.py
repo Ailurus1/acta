@@ -20,7 +20,12 @@ def main() -> None:
     model = AutoAnalyzer(
         model,
         tokenizer=tokenizer,
-        target_layers=["*Block"],
+        target_layers=[
+            "transformer.h.*.attn.c_attn",
+            "transformer.h.*.attn.c_proj",
+            "transformer.h.*.mlp.c_fc",
+            "transformer.h.*.mlp.c_proj",
+        ],
         draw_charts=True,
         verbose=True,
     )
