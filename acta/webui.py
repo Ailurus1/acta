@@ -279,7 +279,6 @@ def create_app() -> Dash:
 
     app.layout = html.Div(
         [
-            dcc.Store(id="model_loaded", data=False),
             html.Div(
                 [
                     html.H2("ACTA", className="acta-title"),
@@ -352,22 +351,10 @@ def create_app() -> Dash:
                             html.Div(
                                 [
                                     html.Button(
-                                        "Load model",
-                                        id="btn_load",
+                                        "Run analysis",
+                                        id="btn_run",
                                         n_clicks=0,
-                                        className="acta-btn acta-btn-primary",
-                                    ),
-                                    html.Span(
-                                        [
-                                            html.Button(
-                                                "Run analysis",
-                                                id="btn_run",
-                                                n_clicks=0,
-                                                className="acta-btn acta-btn-run",
-                                            ),
-                                        ],
-                                        id="run-wrap",
-                                        style={"display": "none", "marginLeft": "10px"},
+                                        className="acta-btn acta-btn-run",
                                     ),
                                 ],
                                 className="acta-row",
@@ -377,13 +364,13 @@ def create_app() -> Dash:
                                 [
                                     html.P("Progress", className="acta-label"),
                                     html.P(
-                                        "Idle",
+                                        "Waiting",
                                         id="progress-title",
                                         className="acta-sub",
                                         style={"margin": "0 0 6px"},
                                     ),
                                     html.Progress(
-                                        id="stage-progress",
+                                        id="progress",
                                         value=0,
                                         max=100,
                                         style={"width": "100%", "display": "block"},
@@ -447,47 +434,27 @@ def create_app() -> Dash:
     def suggest_payload(_: int, source: str, task: str) -> str:
         return _sample_payload(source, task)
 
-    @app.callback(
-        Output("run-wrap", "style"),
-        Input("model_loaded", "data"),
-    )
-    def toggle_run_button(loaded: bool) -> dict[str, Any]:
-        if loaded:
-            return {
-                "display": "inline-block",
-                "marginLeft": "10px",
-                "verticalAlign": "middle",
-            }
-        return {"display": "none"}
+    def _model_key(source: str, task: str, hf_name: str, local_path: str) -> str:
+        if source == "hf":
+            return f"hf::{task}::{(hf_name or '').strip()}"
+        return f"local::{task}::{Path((local_path or '').strip()).expanduser().resolve()}"
 
-    @app.callback(
-        Output("model_loaded", "data"),
-        Output("status", "children"),
-        Output("progress-title", "children"),
-        Output("stage-progress", "value"),
-        Input("btn_load", "n_clicks"),
-        State("source", "value"),
-        State("task", "value"),
-        State("hf_name", "value"),
-        State("local_path", "value"),
-        running=[
-            (Output("progress-title", "children"), "Stage 1/3: Loading model...", "Idle"),
-            (Output("stage-progress", "value"), 15, 0),
-        ],
-        prevent_initial_call=True,
-    )
-    def load_model(
-        _: int, source: str, task: str, hf_name: str, local_path: str
-    ) -> tuple[bool, str, str, int]:
+    def _ensure_model_loaded(
+        source: str, task: str, hf_name: str, local_path: str
+    ) -> tuple[str, int, str]:
         _log("load_model start source=%s task=%s pid=%s", source, task, os.getpid())
         try:
             device = _preferred_device()
             _log("selected device=%s", device)
+            key = _model_key(source, task, hf_name, local_path)
+            if _STATE.get("model") is not None and _STATE.get("model_key") == key:
+                _log("reuse loaded model key=%s", key)
+                return "Stage 1/3 complete: model reused", 33, "Model reused from memory."
             if source == "hf":
                 name = (hf_name or "").strip()
                 if not name:
                     _log("load_model missing hf name")
-                    return False, "Please provide a HuggingFace model name.", "Idle", 0
+                    return "Load failed", 0, "Please provide a HuggingFace model name."
                 _log("loading hf model name=%s task=%s", name, task)
                 if task == "causal-lm":
                     model = AutoModelForCausalLM.from_pretrained(
@@ -506,16 +473,19 @@ def create_app() -> Dash:
                         "source": source,
                         "task": task,
                         "device": device,
+                        "model_key": key,
                     }
                 )
                 _log("load_model success hf")
-                return True, (
-                    f"Loaded HuggingFace model on {device}: {name} ({task})."
-                ), "Stage 1/3 complete: Model loaded", 33
+                return (
+                    "Stage 1/3 complete: model loaded",
+                    33,
+                    f"Loaded HuggingFace model on {device}: {name} ({task}).",
+                )
             path = Path((local_path or "").strip()).expanduser().resolve()
             if not path.exists():
                 _log("load_model local missing path=%s", path)
-                return False, f"Local file not found: {path}", "Idle", 0
+                return "Load failed", 0, f"Local file not found: {path}"
             _log("loading local checkpoint path=%s", path)
             payload = _torch_load(path)
             model = _extract_nn_module(payload).to(device).eval()
@@ -527,13 +497,18 @@ def create_app() -> Dash:
                     "source": source,
                     "task": task,
                     "device": device,
+                    "model_key": key,
                 }
             )
             _log("load_model success local")
-            return True, f"Loaded local model on {device} from:\n{path}", "Stage 1/3 complete: Model loaded", 33
+            return (
+                "Stage 1/3 complete: model loaded",
+                33,
+                f"Loaded local model on {device} from:\n{path}",
+            )
         except Exception as e:
             _log("load_model failed error=%s\n%s", e, traceback.format_exc())
-            return False, f"Load failed: {e}", "Idle", 0
+            return "Load failed", 0, f"Load failed: {e}"
 
     @app.callback(
         Output("fig_layer", "figure"),
@@ -545,17 +520,21 @@ def create_app() -> Dash:
         Output("viz-3d", "children"),
         Output("status", "children", allow_duplicate=True),
         Output("progress-title", "children", allow_duplicate=True),
-        Output("stage-progress", "value", allow_duplicate=True),
+        Output("progress", "value", allow_duplicate=True),
         Input("btn_run", "n_clicks"),
         State("payload", "value"),
         State("target_layers", "value"),
+        State("source", "value"),
+        State("task", "value"),
+        State("hf_name", "value"),
+        State("local_path", "value"),
         running=[
             (
                 Output("progress-title", "children"),
-                "Stage 2/3: Running inference...",
-                "Stage 1/3 complete: Model loaded",
+                "Stage 2/3: running inference...",
+                "Stage 1/3 complete: model loaded",
             ),
-            (Output("stage-progress", "value"), 55, 33),
+            (Output("progress", "value"), 66, 33),
         ],
         prevent_initial_call=True,
     )
@@ -563,6 +542,10 @@ def create_app() -> Dash:
         _: int,
         payload_text: str,
         target_layers: str | None,
+        source: str,
+        task: str,
+        hf_name: str,
+        local_path: str,
     ) -> tuple[
         Any,
         Any,
@@ -575,13 +558,25 @@ def create_app() -> Dash:
         str,
         int,
     ]:
+        load_title, load_val, load_msg = _ensure_model_loaded(
+            source, task, hf_name, local_path
+        )
         model = _STATE.get("model")
         if model is None:
             empty = _empty_fig("No model loaded")
-            return empty, empty, empty, [], [], "", [], "Load model first.", "Idle", 0
+            return (
+                empty,
+                empty,
+                empty,
+                [],
+                [],
+                "",
+                [],
+                load_msg,
+                "Stage 1/3 failed: model load",
+                0,
+            )
         tokenizer = _STATE.get("tokenizer")
-        source = _STATE.get("source")
-        task = _STATE.get("task")
         device = _STATE.get("device", torch.device("cpu"))
         _log(
             "run_analysis start source=%s task=%s model=%s device=%s payload_chars=%d",
@@ -669,14 +664,25 @@ def create_app() -> Dash:
                 csv_cols,
                 table,
                 viz_children,
-                f"Analysis complete. Stats: {wrapped.dump_stats_path}",
-                "Stage 3/3 complete: Charts built",
+                f"{load_msg}\nAnalysis complete. Stats: {wrapped.dump_stats_path}",
+                "Stage 3/3 complete: charts built",
                 100,
             )
         except Exception as e:
             _log("run_analysis failed error=%s\n%s", e, traceback.format_exc())
             empty = _empty_fig("Run failed")
-            return empty, empty, empty, [], [], "", [], f"Run failed: {e}", "Idle", 0
+            return (
+                empty,
+                empty,
+                empty,
+                [],
+                [],
+                "",
+                [],
+                f"Run failed: {e}",
+                "Stage 2/3 failed: inference",
+                0,
+            )
 
     return app
 

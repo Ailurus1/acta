@@ -22,6 +22,11 @@ body {
   font-family: "DM Sans", system-ui, -apple-system, sans-serif;
 }
 
+.acta-shell,
+.acta-shell * {
+  color: var(--text);
+}
+
 .acta-shell {
   max-width: 1180px;
   margin: 0 auto;
@@ -166,6 +171,34 @@ button.acta-btn-run:hover {
 .acta-card input[type="text"] {
   background-color: rgba(15, 23, 42, 0.65) !important;
   border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+
+.acta-card input::placeholder,
+.acta-card textarea::placeholder {
+  color: var(--muted) !important;
+  opacity: 1;
+}
+
+.acta-card .Select-menu-outer,
+.acta-card .Select-menu {
+  background-color: rgba(15, 23, 42, 0.95) !important;
+  color: var(--text) !important;
+}
+
+.acta-card .Select-option {
+  background-color: transparent !important;
+  color: var(--text) !important;
+}
+
+.acta-card .Select-option.is-focused {
+  background-color: rgba(56, 189, 248, 0.2) !important;
+}
+
+.acta-card .Select-value-label,
+.acta-card .Select-placeholder,
+.acta-card .Select-arrow-zone,
+.acta-card .Select-arrow {
   color: var(--text) !important;
 }
 

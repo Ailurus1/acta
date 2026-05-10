@@ -313,7 +313,7 @@ class _AnalyzerModel(nn.Module):
         self._in_generate: bool = False
         self._collect_layer_channel_stats: bool = True
         self._collect_outlier_payload: bool = True
-        self._collect_token_trends: bool = bool(self.draw_charts)
+        self._collect_token_trends: bool = True
         self._collect_feature_level: bool = True
         self._run_token_frac_by_layer: dict[str, list[torch.Tensor]] = {}
         self._run_token_mean_by_layer: dict[str, list[torch.Tensor]] = {}
@@ -864,11 +864,21 @@ class _AnalyzerModel(nn.Module):
 
         if self._prompt_len is not None:
             use_len = int(self._prompt_len)
-            token_ids = list(range(use_len))
+            input_ids = kwargs.get("input_ids")
+            if (
+                isinstance(input_ids, torch.Tensor)
+                and input_ids.ndim == 2
+                and input_ids.shape[1] >= use_len
+            ):
+                token_ids = (
+                    input_ids[0, :use_len].detach().cpu().to(torch.long).tolist()
+                )
+            else:
+                token_ids = list(range(use_len))
             decoded = (
                 self._sequence_position_labels(use_len)
                 if self.tokenizer is None
-                else [decode_token(self.tokenizer, i) for i in token_ids]
+                else [decode_token(self.tokenizer, int(i)) for i in token_ids]
             )
             bsz = self._current_run_batch_size()
             fake = torch.arange(use_len, dtype=torch.long).unsqueeze(0).repeat(bsz, 1)
