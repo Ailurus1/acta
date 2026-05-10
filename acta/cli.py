@@ -143,6 +143,8 @@ Commands:
          Charts default to the same directory as the stats file unless
          --path-to-charts is set.
 
+  ui     Launch Dash-based web UI for loading/running models interactively.
+
   help   Print this overview (same as `acta help`).
 """
 
@@ -267,6 +269,17 @@ def plot_cmd(path_to_stats: Path, path_to_charts: Path | None) -> None:
     )
     output_dir = build_charts_from_stats_file(stats_path, output_dir=out)
     click.echo(f"Charts written under:\n  {output_dir}")
+
+
+@main.command("ui")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host bind address.")
+@click.option("--port", default=8050, show_default=True, type=int, help="Port to serve UI.")
+@click.option("--debug/--no-debug", default=False, show_default=True, help="Dash debug mode.")
+def ui_cmd(host: str, port: int, debug: bool) -> None:
+    from acta.webui import launch
+
+    click.echo(f"Starting acta web UI on http://{host}:{port}")
+    launch(host=host, port=port, debug=debug)
 
 
 @main.command("help")
