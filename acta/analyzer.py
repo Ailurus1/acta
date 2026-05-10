@@ -95,6 +95,32 @@ def _channel_stats(values: torch.Tensor) -> Dict[str, Union[Dict, List[float]]]:
     }
 
 
+def _channel_stats_from_running_moments(
+    *,
+    count: int,
+    sum_: torch.Tensor,
+    sumsq: torch.Tensor,
+) -> Dict[str, Union[Dict, List[float]]]:
+    if count <= 0 or sum_.numel() == 0:
+        return {
+            "mean": [],
+            "variance": [],
+            "quantiles": {"q25": [], "q50": [], "q75": []},
+            "kurtosis": [],
+        }
+    c = float(count)
+    mean = sum_ / c
+    var = torch.clamp((sumsq / c) - mean.pow(2), min=0.0)
+    n_ch = int(mean.numel())
+    empty = [None] * n_ch
+    return {
+        "mean": mean.cpu().tolist(),
+        "variance": var.cpu().tolist(),
+        "quantiles": {"q25": empty, "q50": empty, "q75": empty},
+        "kurtosis": empty,
+    }
+
+
 def _prepare_per_channel(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
     """
     Convert tensor to shape [N, C] where C is channel/features dimension.
@@ -283,8 +309,12 @@ class _AnalyzerModel(nn.Module):
         self.chart_3d_max_tokens = int(chart_3d_max_tokens)
         self._finalize_on_exit_enabled = bool(finalize_on_exit)
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
-        self._layer_values: dict[str, list[torch.Tensor]] = {}
+        self._layer_running_stats: dict[str, dict[str, torch.Tensor | int]] = {}
         self._in_generate: bool = False
+        self._collect_layer_channel_stats: bool = True
+        self._collect_outlier_payload: bool = True
+        self._collect_token_trends: bool = bool(self.draw_charts)
+        self._collect_feature_level: bool = True
         self._run_token_frac_by_layer: dict[str, list[torch.Tensor]] = {}
         self._run_token_mean_by_layer: dict[str, list[torch.Tensor]] = {}
         self._run_token_var_by_layer: dict[str, list[torch.Tensor]] = {}
@@ -507,141 +537,164 @@ class _AnalyzerModel(nn.Module):
                 if not tensor.is_floating_point():
                     return
 
+                t_cpu: torch.Tensor | None = None
                 if self._in_generate:
                     self._maybe_set_prompt_len_from_tensor(tensor)
-                    t_float = tensor.detach().float()
-                    frac = _token_outlier_fraction(
-                        t_float, threshold=self.outlier_threshold
-                    )
-                    if frac is not None:
-                        self._run_token_frac_by_layer.setdefault(layer_name, []).append(
-                            frac.cpu()
+                    if self._collect_outlier_payload:
+                        t_cpu = tensor.detach().float().cpu()
+                        frac = _token_outlier_fraction(
+                            t_cpu, threshold=self.outlier_threshold
                         )
-                        token_mean = t_float.mean(dim=-1)  # [B, S]
-                        token_var = t_float.var(dim=-1, unbiased=False)  # [B, S]
-                        self._run_token_mean_by_layer.setdefault(layer_name, []).append(
-                            token_mean.cpu()
-                        )
-                        self._run_token_var_by_layer.setdefault(layer_name, []).append(
-                            token_var.cpu()
-                        )
+                        if frac is not None:
+                            self._run_token_frac_by_layer.setdefault(
+                                layer_name, []
+                            ).append(frac)
 
-                        if tensor.ndim == 3 and self._prompt_len is not None:
-                            b, s, h = tensor.shape
-                            t = min(int(self._prompt_len), int(s))
-                            if t > 0:
-                                abs_act = t_float[:, :t, :]  # [B, T, H]
-
-                                tok_max = (
-                                    abs_act.max(dim=-1).values.max(dim=0).values.cpu()
-                                )  # [T]
-                                self._run_token_maxabs_by_layer.setdefault(
+                            if self._collect_token_trends:
+                                token_mean = t_cpu.mean(dim=-1)  # [B, S]
+                                token_var = t_cpu.var(dim=-1, unbiased=False)  # [B, S]
+                                self._run_token_mean_by_layer.setdefault(
                                     layer_name, []
-                                ).append(tok_max)
+                                ).append(token_mean)
+                                self._run_token_var_by_layer.setdefault(
+                                    layer_name, []
+                                ).append(token_var)
 
-                                abs_cpu = abs_act.max(dim=0).values.cpu()  # [T, H]
-                                if (
-                                    layer_name
-                                    not in self._run_max_abs_token_feature_by_layer
-                                ):
-                                    self._run_max_abs_token_feature_by_layer[
+                            if (
+                                self._collect_feature_level
+                                and tensor.ndim == 3
+                                and self._prompt_len is not None
+                            ):
+                                b, s, h = tensor.shape
+                                t = min(int(self._prompt_len), int(s))
+                                if t > 0:
+                                    abs_act = t_cpu[:, :t, :].abs()  # [B, T, H]
+
+                                    if self._collect_token_trends:
+                                        tok_max = (
+                                            abs_act.max(dim=-1).values.max(dim=0).values
+                                        )  # [T]
+                                        self._run_token_maxabs_by_layer.setdefault(
+                                            layer_name, []
+                                        ).append(tok_max)
+
+                                    abs_cpu = abs_act.max(dim=0).values  # [T, H]
+                                    prev_layer = self._run_max_abs_token_feature_by_layer.get(
                                         layer_name
-                                    ] = abs_cpu
-                                else:
-                                    prev_layer = (
+                                    )
+                                    if (
+                                        prev_layer is None
+                                        or prev_layer.shape != abs_cpu.shape
+                                    ):
                                         self._run_max_abs_token_feature_by_layer[
                                             layer_name
-                                        ]
-                                    )
-                                    if prev_layer.shape == abs_cpu.shape:
+                                        ] = abs_cpu
+                                    else:
                                         self._run_max_abs_token_feature_by_layer[
                                             layer_name
                                         ] = torch.maximum(prev_layer, abs_cpu)
 
-                                if (
-                                    self._run_max_abs_token_feature is None
-                                    or self._run_hidden_dim != int(h)
-                                ):
-                                    self._run_hidden_dim = int(h)
-                                    self._run_max_abs_token_feature = abs_cpu
-                                    layer_idx = self._run_layer_to_index.setdefault(
-                                        layer_name, len(self._run_layer_order)
-                                    )
-                                    if layer_idx == len(self._run_layer_order):
-                                        self._run_layer_order.append(layer_name)
-                                    self._run_argmax_layer_per_token_feature = (
-                                        torch.full(
-                                            (t, int(h)),
-                                            int(layer_idx),
-                                            dtype=torch.int32,
-                                        )
-                                    )
-                                else:
-                                    layer_idx = self._run_layer_to_index.setdefault(
-                                        layer_name, len(self._run_layer_order)
-                                    )
-                                    if layer_idx == len(self._run_layer_order):
-                                        self._run_layer_order.append(layer_name)
-                                    prev_max = self._run_max_abs_token_feature
-                                    cur = abs_cpu
-                                    updated_max = torch.maximum(prev_max, cur)
-                                    self._run_max_abs_token_feature = updated_max
                                     if (
-                                        self._run_argmax_layer_per_token_feature
-                                        is not None
+                                        self._run_max_abs_token_feature is None
+                                        or self._run_hidden_dim != int(h)
                                     ):
-                                        upd = cur > prev_max
-                                        self._run_argmax_layer_per_token_feature[
-                                            upd
-                                        ] = int(layer_idx)
+                                        self._run_hidden_dim = int(h)
+                                        self._run_max_abs_token_feature = abs_cpu
+                                        layer_idx = self._run_layer_to_index.setdefault(
+                                            layer_name, len(self._run_layer_order)
+                                        )
+                                        if layer_idx == len(self._run_layer_order):
+                                            self._run_layer_order.append(layer_name)
+                                        self._run_argmax_layer_per_token_feature = (
+                                            torch.full(
+                                                (t, int(h)),
+                                                int(layer_idx),
+                                                dtype=torch.int32,
+                                            )
+                                        )
+                                    else:
+                                        layer_idx = self._run_layer_to_index.setdefault(
+                                            layer_name, len(self._run_layer_order)
+                                        )
+                                        if layer_idx == len(self._run_layer_order):
+                                            self._run_layer_order.append(layer_name)
+                                        prev_max = self._run_max_abs_token_feature
+                                        updated_max = torch.maximum(prev_max, abs_cpu)
+                                        self._run_max_abs_token_feature = updated_max
+                                        if (
+                                            self._run_argmax_layer_per_token_feature
+                                            is not None
+                                        ):
+                                            upd = abs_cpu > prev_max
+                                            self._run_argmax_layer_per_token_feature[
+                                                upd
+                                            ] = int(layer_idx)
 
-                                mask = abs_act >= float(
-                                    self.outlier_threshold
-                                )  # [B, T, H]
-                                self._run_feature_token_count_by_layer[layer_name] = (
-                                    self._run_feature_token_count_by_layer.get(
-                                        layer_name, 0
+                                    mask = abs_act >= float(self.outlier_threshold)
+                                    self._run_feature_token_count_by_layer[layer_name] = (
+                                        self._run_feature_token_count_by_layer.get(
+                                            layer_name, 0
+                                        )
+                                        + (t * int(b))
                                     )
-                                    + (t * int(b))
-                                )
-                                if layer_name not in self._run_feature_counts_by_layer:
-                                    self._run_feature_counts_by_layer[layer_name] = (
-                                        mask.sum(dim=(0, 1)).cpu()
-                                    )
-                                else:
-                                    self._run_feature_counts_by_layer[layer_name] += (
-                                        mask.sum(dim=(0, 1)).cpu()
-                                    )
+                                    feat_counts = mask.sum(dim=(0, 1))
+                                    if layer_name not in self._run_feature_counts_by_layer:
+                                        self._run_feature_counts_by_layer[layer_name] = (
+                                            feat_counts
+                                        )
+                                    else:
+                                        self._run_feature_counts_by_layer[layer_name] += (
+                                            feat_counts
+                                        )
 
-                                del abs_act, mask
+                                    del abs_act, mask
 
-                    del t_float
-
-                cpu_flat_in = tensor.detach().float().cpu()
-                flattened = _prepare_per_channel(cpu_flat_in, mod)
-                del cpu_flat_in
-                self._layer_values.setdefault(layer_name, []).append(flattened)
+                if self._collect_layer_channel_stats:
+                    cpu_flat_in = (
+                        t_cpu if t_cpu is not None else tensor.detach().float().cpu()
+                    )
+                    flattened = _prepare_per_channel(cpu_flat_in, mod)
+                    n = int(flattened.shape[0])
+                    if n > 0:
+                        layer_state = self._layer_running_stats.get(layer_name)
+                        sum_chunk = flattened.sum(dim=0)
+                        sumsq_chunk = (flattened * flattened).sum(dim=0)
+                        if layer_state is None:
+                            self._layer_running_stats[layer_name] = {
+                                "count": n,
+                                "sum": sum_chunk,
+                                "sumsq": sumsq_chunk,
+                            }
+                        else:
+                            layer_state["count"] = int(layer_state["count"]) + n
+                            layer_state["sum"] = layer_state["sum"] + sum_chunk
+                            layer_state["sumsq"] = layer_state["sumsq"] + sumsq_chunk
 
             self._hooks.append(module.register_forward_hook(_hook_fn))
             self._log(f"hook registered for layer: {name}")
 
     def reset_stats(self) -> None:
         """Drop accumulated per-layer activation chunks (CPU tensors). Call between runs to free RAM."""
-        self._layer_values.clear()
+        self._layer_running_stats.clear()
 
     def _build_stats(self) -> dict[str, Any]:
         self._log(
-            f"aggregating activation statistics from {len(self._layer_values)} layers"
+            f"aggregating activation statistics from {len(self._layer_running_stats)} layers"
         )
         layers: dict[str, Any] = {}
-        for layer_name, chunks in self._layer_values.items():
-            if not chunks:
+        for layer_name, state in self._layer_running_stats.items():
+            count = int(state.get("count", 0))
+            sum_ = state.get("sum")
+            sumsq = state.get("sumsq")
+            if count <= 0 or not isinstance(sum_, torch.Tensor) or not isinstance(
+                sumsq, torch.Tensor
+            ):
                 continue
-            data = torch.cat(chunks, dim=0)
-            layer_stats = _channel_stats(data)
-            layer_stats["num_observations"] = data.shape[0]
+            layer_stats = _channel_stats_from_running_moments(
+                count=count, sum_=sum_, sumsq=sumsq
+            )
+            layer_stats["num_observations"] = count
             layers[layer_name] = layer_stats
-            del data
         return {"layers": layers}
 
     def _finalize_on_exit(self) -> None:
@@ -1082,8 +1135,6 @@ class _AnalyzerModel(nn.Module):
                 iqr_mask = (max_abs < lower) | (max_abs > upper)  # [T, H]
                 interquantile_outliers_list = iqr_mask.any(dim=1).cpu().tolist()
 
-                # Massive activations are scalar (token, feature) events that are rare
-                # across sequence positions, unlike outlier features which are vectors.
                 feature_prevalence = (
                     (max_abs >= float(self.outlier_threshold))
                     .to(torch.float32)
