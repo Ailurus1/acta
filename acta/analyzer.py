@@ -674,8 +674,15 @@ class _AnalyzerModel(nn.Module):
             self._log(f"hook registered for layer: {name}")
 
     def reset_stats(self) -> None:
-        """Drop accumulated per-layer activation chunks (CPU tensors). Call between runs to free RAM."""
         self._layer_running_stats.clear()
+
+    def unregister_hooks(self) -> None:
+        for handle in self._hooks:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._hooks.clear()
 
     def _build_stats(self) -> dict[str, Any]:
         self._log(

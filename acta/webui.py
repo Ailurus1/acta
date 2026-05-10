@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import csv
 import json
 import logging
@@ -14,6 +13,7 @@ import torch
 from dash import Dash, Input, Output, State, dash_table, dcc, html
 import plotly.graph_objects as go
 import plotly.io as pio
+import numpy as np
 from torch import nn
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
@@ -46,6 +46,22 @@ if not logger.handlers:
 
 def _log(msg: str, *args: Any) -> None:
     logger.info(msg, *args)
+
+
+_GRAPH_STYLE: dict[str, str | int] = {
+    "height": "520px",
+    "minHeight": "480px",
+    "width": "100%",
+}
+
+
+def _hover_plain(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def _tensor_brief(v: Any) -> str:
@@ -129,51 +145,189 @@ def _csv_for_dash(csv_path: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     return rows, cols
 
 
-def _img_data_uri(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    b = path.read_bytes()
-    return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
-
-
-def _build_3d_gallery(run_dir: Path) -> list[Any]:
-    items: list[Any] = []
-    per_layer = run_dir / "outlier_token_feature_3d_per_layer"
-    if per_layer.exists():
-        shown = 0
-        for p in sorted(per_layer.glob("*.png")):
-            src = _img_data_uri(p)
-            if src is None:
-                continue
-            items.append(
-                html.Div(
-                    [
-                        html.P(f"Per-layer: {p.stem}", className="acta-label"),
-                        html.Img(src=src, className="acta-chart-img"),
-                    ],
-                    className="acta-chart-card",
-                )
-            )
-            shown += 1
-            if shown >= 4:
-                break
-    if not items:
-        return [html.P("No visualizer 3D charts generated for this run.", className="acta-sub")]
-    return items
-
-
-def _image_block(title: str, src: str | None) -> list[Any]:
-    if not src:
-        return [html.P(f"{title}: not available for this run.", className="acta-sub")]
-    return [
-        html.Div(
+def _fig_outlier_token_feature_3d(stats: dict[str, Any]) -> go.Figure:
+    out = stats.get("outliers", {})
+    if not isinstance(out, dict):
+        return _empty_fig("No outlier payload")
+    z = out.get("token_feature_magnitude")
+    feat_dims = out.get("outlier_feature_dims", [])
+    tokens = out.get("prompt_tokens", [])
+    if not isinstance(z, list) or not z or not feat_dims:
+        return _empty_fig("No outlier token feature 3D data")
+    z_np = np.asarray(z, dtype=np.float64)
+    if z_np.ndim != 2:
+        return _empty_fig("Malformed token_feature_magnitude shape")
+    n_tok, n_feat = int(z_np.shape[0]), int(z_np.shape[1])
+    fd_raw = feat_dims if isinstance(feat_dims, list) else []
+    fd_use: list[int] = []
+    for j in range(n_feat):
+        if j < len(fd_raw):
+            fd_use.append(int(fd_raw[j]))
+        else:
+            fd_use.append(j)
+    tok_list = tokens if isinstance(tokens, list) else []
+    xi = np.arange(n_feat, dtype=np.float64)
+    yi = np.arange(n_tok, dtype=np.float64)
+    hover: list[list[str]] = []
+    for ti in range(n_tok):
+        tok_s = _hover_plain(str(tok_list[ti]) if ti < len(tok_list) else f"<idx {ti}>")
+        hover.append(
             [
-                html.P(title, className="acta-label"),
-                html.Img(src=src, className="acta-chart-img"),
-            ],
-            className="acta-chart-card",
+                f"token idx {ti}: {tok_s}<br>feature dim {fd_use[fj]}<br>magnitude: {float(z_np[ti, fj]):.6g}"
+                for fj in range(n_feat)
+            ]
         )
-    ]
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=xi,
+                y=yi,
+                z=z_np,
+                surfacecolor=z_np,
+                colorscale="Viridis",
+                hovertext=hover,
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="outlier token feature 3d",
+        scene=dict(
+            xaxis_title="Feature dim index",
+            yaxis_title="Token index",
+            zaxis_title="Magnitude",
+            xaxis=dict(tickmode="linear"),
+            yaxis=dict(tickmode="linear"),
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    return _apply_dark(fig)
+
+
+def _fig_token_layer_maxabs_3d(stats: dict[str, Any]) -> go.Figure:
+    out = stats.get("outliers", {})
+    trends = out.get("token_layer_trends", {}) if isinstance(out, dict) else {}
+    if not isinstance(trends, dict):
+        return _empty_fig("No token layer trend data")
+    z = trends.get("max_abs")
+    layers = trends.get("layer_names", [])
+    tokens = trends.get("tokens", [])
+    if not isinstance(z, list) or not z:
+        return _empty_fig("No token layer maxabs 3D data")
+    z_np = np.asarray(z, dtype=np.float64)
+    if z_np.ndim != 2:
+        return _empty_fig("Malformed token layer maxabs shape")
+    n_layer, n_tok = int(z_np.shape[0]), int(z_np.shape[1])
+    ly = layers if isinstance(layers, list) else []
+    tok_list = tokens if isinstance(tokens, list) else []
+    xi = np.arange(n_tok, dtype=np.float64)
+    yi = np.arange(n_layer, dtype=np.float64)
+    hover_ll: list[list[str]] = []
+    for li in range(n_layer):
+        ln = str(ly[li]) if li < len(ly) else f"layer[{li}]"
+        hover_ll.append(
+            [
+                f"{ln}<br>token idx {tj}: {_hover_plain(str(tok_list[tj]) if tj < len(tok_list) else str(tj))}<br>max |act|: {float(z_np[li, tj]):.6g}"
+                for tj in range(n_tok)
+            ]
+        )
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=xi,
+                y=yi,
+                z=z_np,
+                surfacecolor=z_np,
+                colorscale="Plasma",
+                hovertext=hover_ll,
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="token layer maxabs 3d",
+        scene=dict(
+            xaxis_title="Token index",
+            yaxis_title="Layer index",
+            zaxis_title="Max |activation|",
+            xaxis=dict(tickmode="linear"),
+            yaxis=dict(tickmode="linear"),
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+    return _apply_dark(fig)
+
+
+def _fig_feature_magnitudes_per_layer(stats: dict[str, Any]) -> list[Any]:
+    out = stats.get("outliers", {})
+    by_layer = out.get("token_feature_magnitude_by_layer", {}) if isinstance(out, dict) else {}
+    feat_dims = out.get("outlier_feature_dims", []) if isinstance(out, dict) else []
+    if not isinstance(by_layer, dict) or not by_layer:
+        return [html.P("No per-layer feature magnitude data", className="acta-sub")]
+    items: list[Any] = []
+    for layer_name, data in sorted(by_layer.items()):
+        if not isinstance(data, list) or not data:
+            continue
+        z_np = np.asarray(data, dtype=np.float64)
+        if z_np.ndim != 2:
+            continue
+        n_tok, n_feat = int(z_np.shape[0]), int(z_np.shape[1])
+        fd_raw = feat_dims if isinstance(feat_dims, list) else []
+        fd_use_pl: list[int] = []
+        for j in range(n_feat):
+            if j < len(fd_raw):
+                fd_use_pl.append(int(fd_raw[j]))
+            else:
+                fd_use_pl.append(j)
+        xi = np.arange(n_feat, dtype=np.float64)
+        yi = np.arange(n_tok, dtype=np.float64)
+        hover_pl: list[list[str]] = []
+        for ti in range(n_tok):
+            hover_pl.append(
+                [
+                    f"{layer_name}<br>token idx {ti}<br>feature dim {fd_use_pl[fj]}<br>magnitude: {float(z_np[ti, fj]):.6g}"
+                    for fj in range(n_feat)
+                ]
+            )
+        fig = go.Figure(
+            data=[
+                go.Surface(
+                    x=xi,
+                    y=yi,
+                    z=z_np,
+                    surfacecolor=z_np,
+                    colorscale="Cividis",
+                    hovertext=hover_pl,
+                    hovertemplate="%{hovertext}<extra></extra>",
+                )
+            ]
+        )
+        fig.update_layout(
+            title=f"PER_LAYER: {layer_name}",
+            scene=dict(
+                xaxis_title="Feature dim index",
+                yaxis_title="Token index",
+                zaxis_title="Magnitude",
+                xaxis=dict(tickmode="linear"),
+                yaxis=dict(tickmode="linear"),
+            ),
+            margin=dict(l=0, r=0, b=0, t=40),
+        )
+        items.append(
+            html.Div(
+                [
+                    dcc.Graph(
+                        figure=_apply_dark(fig),
+                        config={"scrollZoom": True},
+                        style=dict(_GRAPH_STYLE),
+                    )
+                ],
+                className="acta-chart-card",
+            )
+        )
+    if not items:
+        return [html.P("No per-layer feature magnitude data", className="acta-sub")]
+    return items
 
 
 def _apply_dark(fig: go.Figure) -> go.Figure:
@@ -197,11 +351,46 @@ def _fig_layer_means(stats: dict[str, Any]) -> go.Figure:
     if isinstance(layers, dict):
         for ln, st in layers.items():
             m = st.get("mean", [])
-            if isinstance(m, list) and m:
-                names.append(ln)
-                vals.append(float(sum(float(x) for x in m) / max(len(m), 1)))
-    fig = go.Figure(data=[go.Bar(x=names, y=vals, marker_color="#38bdf8")])
-    fig.update_layout(title="Per-layer mean activations", xaxis_title="Layer")
+            if not isinstance(m, list) or not m:
+                continue
+            nums: list[float] = []
+            for x in m:
+                if isinstance(x, bool):
+                    continue
+                if isinstance(x, (int, float)):
+                    v = float(x)
+                    if v == v:
+                        nums.append(v)
+            if not nums:
+                continue
+            names.append(str(ln))
+            vals.append(sum(nums) / len(nums))
+    if not names:
+        fig = _empty_fig("No per-layer mean data (run with targeted layers or check hooks)")
+        fig.update_layout(height=420)
+        return fig
+    pairs = sorted(zip(names, vals), key=lambda nv: nv[1])
+    names_o = [p[0] for p in pairs]
+    vals_o = [p[1] for p in pairs]
+    nh = len(names_o)
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=vals_o,
+                y=names_o,
+                orientation="h",
+                marker_color="#38bdf8",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Per-layer mean activations",
+        xaxis_title="Mean activation (scalar average over channels)",
+        yaxis_title="Layer",
+        height=max(440, min(960, 26 * nh + 160)),
+        margin=dict(l=8, r=16, t=48, b=48),
+        autosize=True,
+    )
     return _apply_dark(fig)
 
 
@@ -276,6 +465,7 @@ def create_app() -> Dash:
 
     app.layout = html.Div(
         [
+            dcc.Store(id="results-ready", data=False),
             html.Div(
                 [
                     html.H2("ACTA", className="acta-title"),
@@ -417,19 +607,29 @@ def create_app() -> Dash:
                                                 },
                                                 page_size=15,
                                             ),
-                                            html.H4("Outlier table", className="acta-h4"),
-                                            html.Pre(id="table", className="acta-table-wrap"),
                                         ],
                                     ),
                                     dcc.Tab(
                                         label="outlier token feature 3d",
                                         value="outlier3d",
-                                        children=[html.Div(id="tab-outlier3d", className="acta-chart-grid")],
+                                        children=[
+                                            dcc.Graph(
+                                                id="fig_outlier3d",
+                                                config={"scrollZoom": True},
+                                                style=dict(_GRAPH_STYLE),
+                                            )
+                                        ],
                                     ),
                                     dcc.Tab(
                                         label="token layer maxabs 3d",
                                         value="layermax3d",
-                                        children=[html.Div(id="tab-layermax3d", className="acta-chart-grid")],
+                                        children=[
+                                            dcc.Graph(
+                                                id="fig_layermax3d",
+                                                config={"scrollZoom": True},
+                                                style=dict(_GRAPH_STYLE),
+                                            )
+                                        ],
                                     ),
                                     dcc.Tab(
                                         label="feature magnitudes per-layer",
@@ -439,12 +639,24 @@ def create_app() -> Dash:
                                     dcc.Tab(
                                         label="per-layer mean activations",
                                         value="means",
-                                        children=[dcc.Graph(id="fig_layer", config={"scrollZoom": True})],
+                                        children=[
+                                            dcc.Graph(
+                                                id="fig_layer",
+                                                config={"scrollZoom": True},
+                                                style=dict(_GRAPH_STYLE),
+                                            )
+                                        ],
                                     ),
                                     dcc.Tab(
                                         label="token trends (mean) heatmap",
                                         value="heatmap",
-                                        children=[dcc.Graph(id="fig_heatmap", config={"scrollZoom": True})],
+                                        children=[
+                                            dcc.Graph(
+                                                id="fig_heatmap",
+                                                config={"scrollZoom": True},
+                                                style=dict(_GRAPH_STYLE),
+                                            )
+                                        ],
                                     ),
                                 ],
                             )
@@ -453,11 +665,22 @@ def create_app() -> Dash:
                     )
                 ],
                 className="acta-col-right",
+                id="right-pane",
+                style={"display": "none"},
             ),
         ]
         ,
         className="acta-shell acta-layout",
     )
+
+    @app.callback(
+        Output("right-pane", "style"),
+        Input("results-ready", "data"),
+    )
+    def toggle_right_pane(ready: bool) -> dict[str, Any]:
+        if bool(ready):
+            return {"display": "block"}
+        return {"display": "none"}
 
     @app.callback(
         Output("payload", "value"),
@@ -548,12 +771,12 @@ def create_app() -> Dash:
     @app.callback(
         Output("fig_layer", "figure"),
         Output("fig_heatmap", "figure"),
+        Output("fig_outlier3d", "figure"),
+        Output("fig_layermax3d", "figure"),
         Output("csv-table", "data"),
         Output("csv-table", "columns"),
-        Output("table", "children"),
-        Output("tab-outlier3d", "children"),
-        Output("tab-layermax3d", "children"),
         Output("tab-perlayer3d", "children"),
+        Output("results-ready", "data"),
         Output("status", "children", allow_duplicate=True),
         Output("progress-title", "children", allow_duplicate=True),
         Output("progress", "value", allow_duplicate=True),
@@ -585,12 +808,12 @@ def create_app() -> Dash:
     ) -> tuple[
         Any,
         Any,
+        Any,
+        Any,
         list[dict[str, Any]],
         list[dict[str, str]],
-        str,
         list[Any],
-        list[Any],
-        list[Any],
+        bool,
         str,
         str,
         int,
@@ -604,12 +827,12 @@ def create_app() -> Dash:
             return (
                 empty,
                 empty,
+                empty,
+                empty,
                 [],
                 [],
-                "",
                 [],
-                [],
-                [],
+                False,
                 load_msg,
                 "Stage 1/3 failed: model load",
                 0,
@@ -624,6 +847,7 @@ def create_app() -> Dash:
             device,
             len(payload_text or ""),
         )
+        wrapped = None
         try:
             tmp = Path(tempfile.mkdtemp(prefix="acta-ui-"))
             _log("temp run dir=%s", tmp)
@@ -685,30 +909,19 @@ def create_app() -> Dash:
                         )
             _log("reading stats from %s", wrapped.dump_stats_path)
             stats = json.loads(Path(wrapped.dump_stats_path).read_text(encoding="utf-8"))
-            table = str(stats.get("outliers", {}).get("table", ""))
-            from acta.visualizer import build_charts_from_stats_file
-
             run_dir = Path(stats.get("_acta", {}).get("output_run_dir", tmp))
-            _log("stage 3/3: building charts")
-            build_charts_from_stats_file(stats_path=wrapped.dump_stats_path, output_dir=run_dir)
+            _log("stage 3/3: building interactive charts")
             csv_rows, csv_cols = _csv_for_dash(run_dir / "acta_results.csv")
-            viz_children = _build_3d_gallery(run_dir)
             _log("run_analysis success")
             return (
                 _fig_layer_means(stats),
                 _fig_token_layer_heatmap(stats),
+                _fig_outlier_token_feature_3d(stats),
+                _fig_token_layer_maxabs_3d(stats),
                 csv_rows,
                 csv_cols,
-                table,
-                _image_block(
-                    "outlier_token_feature_3d.png",
-                    _img_data_uri(run_dir / "outlier_token_feature_3d.png"),
-                ),
-                _image_block(
-                    "token_layer_maxabs_3d.png",
-                    _img_data_uri(run_dir / "token_layer_maxabs_3d.png"),
-                ),
-                _build_3d_gallery(run_dir),
+                _fig_feature_magnitudes_per_layer(stats),
+                True,
                 f"{load_msg}\nAnalysis complete. Stats: {wrapped.dump_stats_path}",
                 "Stage 3/3 complete: charts built",
                 100,
@@ -719,16 +932,22 @@ def create_app() -> Dash:
             return (
                 empty,
                 empty,
+                empty,
+                empty,
                 [],
                 [],
-                "",
                 [],
-                [],
-                [],
+                False,
                 f"Run failed: {e}",
                 "Stage 2/3 failed: inference",
                 0,
             )
+        finally:
+            if wrapped is not None:
+                try:
+                    wrapped.unregister_hooks()
+                except Exception:
+                    pass
 
     return app
 
