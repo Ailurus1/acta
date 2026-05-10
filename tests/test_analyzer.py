@@ -439,3 +439,35 @@ def test_stats_outlier_columns_consistent_after_generate(tmp_path: Path) -> None
         if not bool(flags[i]):
             assert layers[i] in (None, "")
             assert dims[i] in (None, "")
+
+
+def test_stats_include_soft_hard_iqr_massive_columns(tmp_path: Path) -> None:
+    wrapped, stats = _run_case(
+        tmp_path,
+        "new_metrics",
+        _gpt2_builder,
+        _gpt2_input,
+        _gpt2_run,
+        draw_charts=False,
+        num_calls=1,
+    )
+    _ = wrapped
+    out = stats.get("outliers", {})
+    assert isinstance(out, dict)
+
+    soft = out.get("llm.int8() outliers soft difinition", [])
+    hard = out.get("llm.int8() outliers hard definition", [])
+    iqr = out.get("interquantile_outliers", [])
+    massive = out.get("massive_activations", [])
+    token_count = int(out.get("token_count", 0))
+
+    assert len(soft) == token_count
+    assert len(hard) == token_count
+    assert len(iqr) == token_count
+    assert len(massive) == token_count
+
+    table = str(out.get("table", ""))
+    assert "llm.int8() outliers soft difinition" in table
+    assert "llm.int8() outliers hard definition" in table
+    assert "interquantile_outliers" in table
+    assert "massive_activations" in table
