@@ -19,6 +19,24 @@ from .visualizer import draw_activation_charts
 logger = logging.getLogger("acta.analyzer")
 
 
+def _infer_acta_model_name(model: nn.Module) -> str:
+    np_attr = getattr(model, "name_or_path", None)
+    if isinstance(np_attr, str) and np_attr.strip():
+        return np_attr.strip()
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for key in ("name_or_path", "_name_or_path"):
+            v = getattr(cfg, key, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    default_cfg = getattr(model, "default_cfg", None)
+    if isinstance(default_cfg, dict):
+        tag = default_cfg.get("tag") or default_cfg.get("architecture")
+        if isinstance(tag, str) and tag.strip():
+            return tag.strip()
+    return model.__class__.__name__
+
+
 def _maybe_release_accelerator_memory() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -220,6 +238,7 @@ class _AnalyzerModel(nn.Module):
         vit_reg_patch_labels: bool = False,
         asr_chunk_labels: bool = False,
         chart_3d_max_tokens: int = 24,
+        finalize_on_exit: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
@@ -243,6 +262,7 @@ class _AnalyzerModel(nn.Module):
         self.vit_reg_patch_labels = bool(vit_reg_patch_labels)
         self.asr_chunk_labels = bool(asr_chunk_labels)
         self.chart_3d_max_tokens = int(chart_3d_max_tokens)
+        self._finalize_on_exit_enabled = bool(finalize_on_exit)
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._layer_values: dict[str, list[torch.Tensor]] = {}
         self._in_generate: bool = False
@@ -268,7 +288,8 @@ class _AnalyzerModel(nn.Module):
         self._aggregate_generate_outliers: dict[str, Any] | None = None
         self._final_dump_done: bool = False
         self._register_hooks()
-        atexit.register(self._finalize_on_exit)
+        if self._finalize_on_exit_enabled:
+            atexit.register(self._finalize_on_exit)
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -649,6 +670,7 @@ class _AnalyzerModel(nn.Module):
             "dump_stats_path": self.dump_stats_path,
             "session_timestamp": self._session_timestamp,
             "results_csv": (self.dump_stats_root / "acta_results.csv").as_posix(),
+            "model_name": _infer_acta_model_name(self.model),
         }
         with open(self.dump_stats_path, "w", encoding="utf-8") as f:
             json.dump(stats, f, indent=2)
@@ -1017,6 +1039,7 @@ def AutoAnalyzer(
     vit_reg_patch_labels: bool = False,
     asr_chunk_labels: bool = False,
     chart_3d_max_tokens: int = 24,
+    finalize_on_exit: bool = True,
 ) -> nn.Module:
     return _AnalyzerModel(
         model=model,
@@ -1031,4 +1054,5 @@ def AutoAnalyzer(
         vit_reg_patch_labels=vit_reg_patch_labels,
         asr_chunk_labels=asr_chunk_labels,
         chart_3d_max_tokens=chart_3d_max_tokens,
+        finalize_on_exit=finalize_on_exit,
     )

@@ -60,3 +60,4 @@ def test_hook_creates_required_output_files(tmp_path: Path) -> None:
     data = json.loads(stats_path.read_text(encoding="utf-8"))
     assert "layers" in data
     assert "_acta" in data
+    assert data["_acta"].get("model_name") == "Sequential"
