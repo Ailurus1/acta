@@ -382,7 +382,6 @@ def test_sync_outlier_attribution_columns_clears_when_flag_false() -> None:
 
 
 def test_merge_outliers_drops_stale_layer_when_flags_false(tmp_path: Path) -> None:
-    """Merge prefers non-null agg layer; sync must clear if merged outliers are False."""
     base = nn.Linear(4, 4)
     wrapped = AutoAnalyzer(
         base,
@@ -466,8 +465,13 @@ def test_stats_include_soft_hard_iqr_massive_columns(tmp_path: Path) -> None:
     assert len(iqr) == token_count
     assert len(massive) == token_count
 
+    detected = out.get("outliers detected", [])
+    assert isinstance(detected, list)
+    assert len(detected) == token_count
+    assert len(out.get("llm.int8() outliers soft difinition_layer", [])) == token_count
+
     table = str(out.get("table", ""))
-    assert "llm.int8() outliers soft difinition" in table
-    assert "llm.int8() outliers hard definition" in table
-    assert "interquantile_outliers" in table
-    assert "massive_activations" in table
+    assert "idx" in table and "token" in table
+    assert "soft" in table and "hard" in table
+    assert "iqr" in table and "mass" in table
+    assert "any" in table

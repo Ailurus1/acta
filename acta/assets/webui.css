@@ -9,6 +9,8 @@
   --success: #34d399;
   --danger: #f87171;
   --border: rgba(148, 163, 184, 0.22);
+  --field-blue-bg: #0a1e3d;
+  --field-blue-border: rgba(59, 130, 246, 0.42);
 }
 
 body {
@@ -178,11 +180,28 @@ button.acta-btn-run:hover {
 }
 
 /* Dash dropdown / inputs inside dark card */
-.acta-card .Select-control,
-.acta-card input[type="text"] {
+.acta-card input[type="text"]:not(.acta-field-darkblue) {
   background-color: rgba(15, 23, 42, 0.65) !important;
   border-color: var(--border) !important;
   color: var(--text) !important;
+}
+
+.acta-card .Select-control {
+  background-color: rgba(15, 23, 42, 0.65) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+
+.acta-card .acta-field-darkblue .Select-control,
+.acta-card input.acta-field-darkblue[type="text"] {
+  background-color: var(--field-blue-bg) !important;
+  border-color: var(--field-blue-border) !important;
+  color: var(--text) !important;
+}
+
+.acta-card .acta-field-darkblue .Select-menu-outer {
+  background-color: rgba(8, 26, 52, 0.97) !important;
+  border-color: var(--field-blue-border) !important;
 }
 
 .acta-card input::placeholder,

@@ -181,21 +181,47 @@ def _format_outlier_table_decoded(
     massive_activations: list[bool],
     layers: list[str | None],
     channel_dims: list[int | None],
+    soft_layers: list[str | None] | None = None,
+    soft_dims: list[int | None] | None = None,
+    hard_layers: list[str | None] | None = None,
+    hard_dims: list[int | None] | None = None,
+    iqr_layers: list[str | None] | None = None,
+    iqr_dims: list[int | None] | None = None,
+    massive_layers: list[str | None] | None = None,
+    massive_dims: list[int | None] | None = None,
+    outliers_detected: list[bool] | None = None,
 ) -> str:
     def _short(s: str, max_len: int = 20) -> str:
         s = s.replace("\n", "\\n")
         return s if len(s) <= max_len else s[: max_len - 1] + "…"
 
+    def _cell_ln(v: str | None) -> str:
+        return "" if v is None else _short(str(v), max_len=14)
+
+    def _cell_dim(v: int | None) -> str:
+        return "" if v is None else str(v)
+
     lines = []
     header = (
-        f"{'idx':>5}  {'token':<22}  {'token_id':>10}  {'layer':<32}  {'channel_dim':>11}"
-        f"  {'llm.int8() outliers soft difinition':>34}"
-        f"  {'llm.int8() outliers hard definition':>34}"
-        f"  {'interquantile_outliers':>22}"
-        f"  {'massive_activations':>20}"
+        f"{'idx':>5}  {'token':<14}  {'tid':>6}  {'lay*':<14}  {'d*':>5}"
+        f"  {'soft':>5}  {'s_L':<12}  {'s_d':>5}"
+        f"  {'hard':>5}  {'h_L':<12}  {'h_d':>5}"
+        f"  {'iqr':>5}  {'i_L':<12}  {'i_d':>5}"
+        f"  {'mass':>5}  {'m_L':<12}  {'m_d':>5}"
+        f"  {'any':>5}"
     )
     lines.append(header)
     lines.append("-" * len(header))
+    soft_layers = soft_layers or []
+    soft_dims = soft_dims or []
+    hard_layers = hard_layers or []
+    hard_dims = hard_dims or []
+    iqr_layers = iqr_layers or []
+    iqr_dims = iqr_dims or []
+    massive_layers = massive_layers or []
+    massive_dims = massive_dims or []
+    outliers_detected = outliers_detected or []
+
     for i, (tok, tid, layer, dim, soft_o, hard_o, iqr_o, massive_o) in enumerate(
         zip(
             tokens,
@@ -209,42 +235,210 @@ def _format_outlier_table_decoded(
             strict=False,
         )
     ):
-        layer_s = "" if layer is None else layer
-        dim_s = "" if dim is None else str(dim)
+        sl = soft_layers[i] if i < len(soft_layers) else None
+        sd = soft_dims[i] if i < len(soft_dims) else None
+        hl = hard_layers[i] if i < len(hard_layers) else None
+        hd = hard_dims[i] if i < len(hard_dims) else None
+        il = iqr_layers[i] if i < len(iqr_layers) else None
+        ide = iqr_dims[i] if i < len(iqr_dims) else None
+        ml = massive_layers[i] if i < len(massive_layers) else None
+        md = massive_dims[i] if i < len(massive_dims) else None
+        od = outliers_detected[i] if i < len(outliers_detected) else (
+            bool(soft_o or hard_o or iqr_o or massive_o)
+        )
+        layer_s = "" if layer is None else _cell_ln(layer)
+        dim_s = "" if dim is None else _cell_dim(dim)
         lines.append(
-            f"{i:>5}  {_short(tok):<22}  {tid:>10}  {layer_s:<32}  {dim_s:>11}"
-            f"  {str(soft_o):>34}  {str(hard_o):>34}  {str(iqr_o):>22}  {str(massive_o):>20}"
+            f"{i:>5}  {_short(tok, 14):<14}  {tid:>6}  {layer_s:<14}  {dim_s:>5}"
+            f"  {str(soft_o):>5}  {_cell_ln(sl):<12}  {_cell_dim(sd):>5}"
+            f"  {str(hard_o):>5}  {_cell_ln(hl):<12}  {_cell_dim(hd):>5}"
+            f"  {str(iqr_o):>5}  {_cell_ln(il):<12}  {_cell_dim(ide):>5}"
+            f"  {str(massive_o):>5}  {_cell_ln(ml):<12}  {_cell_dim(md):>5}"
+            f"  {str(od):>5}"
         )
     return "\n".join(lines)
 
 
+_SOFT_FLAG = "llm.int8() outliers soft difinition"
+_HARD_FLAG = "llm.int8() outliers hard definition"
+_IQR_FLAG = "interquantile_outliers"
+_MASS_FLAG = "massive_activations"
+_OUTLIERS_DETECTED = "outliers detected"
+
+
+def _attribution_layer_key(flag_key: str) -> str:
+    return f"{flag_key}_layer"
+
+
+def _attribution_dim_key(flag_key: str) -> str:
+    return f"{flag_key}_channel_dim"
+
+
 def _sync_outlier_attribution_columns(payload: dict[str, Any]) -> None:
-    flags = payload.get("llm.int8() outliers hard definition")
-    if not isinstance(flags, list):
-        flags = payload.get("outliers")
-    if not isinstance(flags, list):
-        return
-    layers = payload.get("per_token_layer")
-    dims = payload.get("per_token_channel_dim")
-    if not isinstance(layers, list):
-        layers = []
-    if not isinstance(dims, list):
-        dims = []
-    n = len(flags)
-    while len(layers) < n:
-        layers.append(None)
-    while len(dims) < n:
-        dims.append(None)
-    if len(layers) > n:
-        layers[:] = layers[:n]
-    if len(dims) > n:
-        dims[:] = dims[:n]
+    """Clear per-modality layer/dim when that modality's flag is false; mirror hard columns to legacy keys."""
+
+    def _flag_list(fk: str, alt: str | None) -> list[Any] | None:
+        v = payload.get(fk)
+        if isinstance(v, list):
+            return v
+        if alt is not None:
+            v2 = payload.get(alt)
+            if isinstance(v2, list):
+                return v2
+        return None
+
+    hf = _flag_list(_HARD_FLAG, "outliers")
+    if isinstance(hf, list):
+        n0 = len(hf)
+        hk = _attribution_layer_key(_HARD_FLAG)
+        dk = _attribution_dim_key(_HARD_FLAG)
+        hl = list(payload.get(hk, []))
+        hd = list(payload.get(dk, []))
+        pt_l = list(payload.get("per_token_layer", []))
+        pt_d = list(payload.get("per_token_channel_dim", []))
+        while len(hl) < n0:
+            i = len(hl)
+            hl.append(pt_l[i] if i < len(pt_l) else None)
+        while len(hd) < n0:
+            i = len(hd)
+            hd.append(pt_d[i] if i < len(pt_d) else None)
+        payload[hk] = hl[:n0]
+        payload[dk] = hd[:n0]
+
+    modality_pairs: list[tuple[str, str | None]] = [
+        (_SOFT_FLAG, None),
+        (_HARD_FLAG, "outliers"),
+        (_IQR_FLAG, None),
+        (_MASS_FLAG, None),
+    ]
+    for fk, alt in modality_pairs:
+        flags = _flag_list(fk, alt)
+        if not isinstance(flags, list):
+            continue
+        n = len(flags)
+        lk = _attribution_layer_key(fk)
+        dk = _attribution_dim_key(fk)
+        layers = list(payload.get(lk, []))
+        dims = list(payload.get(dk, []))
+        while len(layers) < n:
+            layers.append(None)
+        while len(dims) < n:
+            dims.append(None)
+        del layers[n:]
+        del dims[n:]
+        for i in range(n):
+            if not bool(flags[i]):
+                layers[i] = None
+                dims[i] = None
+        payload[lk] = layers
+        payload[dk] = dims
+
+    hl = payload.get(_attribution_layer_key(_HARD_FLAG))
+    hd = payload.get(_attribution_dim_key(_HARD_FLAG))
+    if isinstance(hl, list) and isinstance(hd, list):
+        payload["per_token_layer"] = list(hl)
+        payload["per_token_channel_dim"] = list(hd)
+
+
+def _outliers_detected_row(
+    soft: bool, hard: bool, iqr: bool, massive: bool
+) -> bool:
+    return bool(soft or hard or iqr or massive)
+
+
+def _compute_outliers_detected_list(
+    soft: list[bool],
+    hard: list[bool],
+    iqr: list[bool],
+    massive: list[bool],
+) -> list[bool]:
+    n = max(len(soft), len(hard), len(iqr), len(massive))
+    out: list[bool] = []
     for i in range(n):
-        if not bool(flags[i]):
-            layers[i] = None
-            dims[i] = None
-    payload["per_token_layer"] = layers
-    payload["per_token_channel_dim"] = dims
+        s = bool(soft[i]) if i < len(soft) else False
+        h = bool(hard[i]) if i < len(hard) else False
+        iq = bool(iqr[i]) if i < len(iqr) else False
+        m = bool(massive[i]) if i < len(massive) else False
+        out.append(_outliers_detected_row(s, h, iq, m))
+    return out
+
+
+def _best_layer_for_hidden_dim(
+    by_layer: dict[str, torch.Tensor],
+    ti: int,
+    h: int,
+) -> str | None:
+    best_ln: str | None = None
+    best_v = -1.0
+    for ln, ten in by_layer.items():
+        if ten.ndim != 2 or ti >= ten.shape[0] or h >= ten.shape[1]:
+            continue
+        v = float(ten[ti, h].item())
+        if v > best_v:
+            best_v = v
+            best_ln = ln
+    return best_ln
+
+
+def _format_outlier_table_from_payload(o: dict[str, Any]) -> str:
+    tokens = [str(v) for v in o.get("prompt_tokens", [])]
+    token_ids_raw = o.get("prompt_token_ids", [])
+    if isinstance(token_ids_raw, list):
+        token_ids = [
+            int(v) if isinstance(v, int) else int(i)
+            for i, v in enumerate(token_ids_raw)
+        ]
+    else:
+        token_ids = []
+    if len(token_ids) != len(tokens):
+        token_ids = list(range(len(tokens)))
+
+    soft = [bool(v) for v in o.get(_SOFT_FLAG, [])]
+    hard_src = o.get(_HARD_FLAG)
+    if not isinstance(hard_src, list):
+        hard_src = o.get("outliers", [])
+    hard = [bool(v) for v in hard_src] if isinstance(hard_src, list) else []
+    iqr = [bool(v) for v in o.get(_IQR_FLAG, [])]
+    massive = [bool(v) for v in o.get(_MASS_FLAG, [])]
+    layers = [v if v not in ("", None) else None for v in o.get("per_token_layer", [])]
+    dims_raw = o.get("per_token_channel_dim", [])
+    channel_dims: list[int | None] = []
+    for v in dims_raw:
+        if v is None or v == "":
+            channel_dims.append(None)
+        else:
+            try:
+                channel_dims.append(int(v))
+            except (TypeError, ValueError):
+                channel_dims.append(None)
+
+    od = o.get(_OUTLIERS_DETECTED)
+    if not isinstance(od, list):
+        od = _compute_outliers_detected_list(soft, hard, iqr, massive)
+
+    def _col(key: str) -> list[Any]:
+        v = o.get(key)
+        return list(v) if isinstance(v, list) else []
+
+    return _format_outlier_table_decoded(
+        tokens=tokens,
+        token_ids=token_ids,
+        soft_outliers=soft,
+        hard_outliers=hard,
+        interquantile_outliers=iqr,
+        massive_activations=massive,
+        layers=[str(x) if x is not None else None for x in layers],
+        channel_dims=channel_dims,
+        soft_layers=_col(_attribution_layer_key(_SOFT_FLAG)),
+        soft_dims=_col(_attribution_dim_key(_SOFT_FLAG)),
+        hard_layers=_col(_attribution_layer_key(_HARD_FLAG)),
+        hard_dims=_col(_attribution_dim_key(_HARD_FLAG)),
+        iqr_layers=_col(_attribution_layer_key(_IQR_FLAG)),
+        iqr_dims=_col(_attribution_dim_key(_IQR_FLAG)),
+        massive_layers=_col(_attribution_layer_key(_MASS_FLAG)),
+        massive_dims=_col(_attribution_dim_key(_MASS_FLAG)),
+        outliers_detected=[bool(x) for x in od] if od else None,
+    )
 
 
 def decode_token(tokenizer: Any, token_id: int) -> str:
@@ -292,7 +486,6 @@ class _AnalyzerModel(nn.Module):
         self.dump_stats_root, self.output_run_dir, self.dump_stats_path = (
             self._resolve_versioned_dump_paths()
         )
-        self.target_layers = target_layers
         self.draw_charts = draw_charts
         self.outlier_threshold = float(outlier_threshold)
         self.hard_layers_frac = float(hard_layers_frac)
@@ -308,6 +501,11 @@ class _AnalyzerModel(nn.Module):
         self.asr_chunk_labels = bool(asr_chunk_labels)
         self.chart_3d_max_tokens = int(chart_3d_max_tokens)
         self._finalize_on_exit_enabled = bool(finalize_on_exit)
+        tl_raw = target_layers
+        if isinstance(tl_raw, str):
+            tl_parts = [p.strip() for p in tl_raw.split(",") if p.strip()]
+            target_layers = tl_parts if tl_parts else None
+        self.target_layers = target_layers
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._layer_running_stats: dict[str, dict[str, torch.Tensor | int]] = {}
         self._in_generate: bool = False
@@ -376,59 +574,132 @@ class _AnalyzerModel(nn.Module):
 
     def _write_acta_results_csv(self) -> None:
         path = self.output_run_dir / "acta_results.csv"
+        soft_lk = _attribution_layer_key(_SOFT_FLAG)
+        soft_dk = _attribution_dim_key(_SOFT_FLAG)
+        hard_lk = _attribution_layer_key(_HARD_FLAG)
+        hard_dk = _attribution_dim_key(_HARD_FLAG)
+        iqr_lk = _attribution_layer_key(_IQR_FLAG)
+        iqr_dk = _attribution_dim_key(_IQR_FLAG)
+        mass_lk = _attribution_layer_key(_MASS_FLAG)
+        mass_dk = _attribution_dim_key(_MASS_FLAG)
         fieldnames = [
             "idx",
             "token",
             "token_id",
             "layer",
             "channel_dim",
-            "llm.int8() outliers soft difinition",
-            "llm.int8() outliers hard definition",
-            "interquantile_outliers",
-            "massive_activations",
+            _SOFT_FLAG,
+            soft_lk,
+            soft_dk,
+            _HARD_FLAG,
+            hard_lk,
+            hard_dk,
+            _IQR_FLAG,
+            iqr_lk,
+            iqr_dk,
+            _MASS_FLAG,
+            mass_lk,
+            mass_dk,
+            _OUTLIERS_DETECTED,
         ]
         rows: list[dict[str, Any]] = []
         if self._aggregate_generate_outliers is not None:
-            tokens = self._aggregate_generate_outliers.get("prompt_tokens", [])
-            tids = self._aggregate_generate_outliers.get("prompt_token_ids", [])
-            soft_flags = self._aggregate_generate_outliers.get(
-                "llm.int8() outliers soft difinition", []
-            )
-            hard_flags = self._aggregate_generate_outliers.get(
-                "llm.int8() outliers hard definition", []
-            )
-            iqr_flags = self._aggregate_generate_outliers.get(
-                "interquantile_outliers", []
-            )
-            massive_flags = self._aggregate_generate_outliers.get(
-                "massive_activations", []
-            )
-            layers = self._aggregate_generate_outliers.get("per_token_layer", [])
-            dims = self._aggregate_generate_outliers.get("per_token_channel_dim", [])
+            agg = self._aggregate_generate_outliers
+            tokens = agg.get("prompt_tokens", [])
+            if not isinstance(tokens, list):
+                tokens = []
+            tids = agg.get("prompt_token_ids", [])
+            if not isinstance(tids, list):
+                tids = []
+            soft_flags = agg.get(_SOFT_FLAG, [])
+            if not isinstance(soft_flags, list):
+                soft_flags = []
+            hard_flags = agg.get(_HARD_FLAG)
+            if not isinstance(hard_flags, list):
+                hard_flags = agg.get("outliers", [])
+            if not isinstance(hard_flags, list):
+                hard_flags = []
+            iqr_flags = agg.get(_IQR_FLAG, [])
+            if not isinstance(iqr_flags, list):
+                iqr_flags = []
+            massive_flags = agg.get(_MASS_FLAG, [])
+            if not isinstance(massive_flags, list):
+                massive_flags = []
+            layers = agg.get("per_token_layer", [])
+            if not isinstance(layers, list):
+                layers = []
+            dims = agg.get("per_token_channel_dim", [])
+            if not isinstance(dims, list):
+                dims = []
+            soft_layers = agg.get(soft_lk, [])
+            if not isinstance(soft_layers, list):
+                soft_layers = []
+            soft_dims = agg.get(soft_dk, [])
+            if not isinstance(soft_dims, list):
+                soft_dims = []
+            hard_layers = agg.get(hard_lk, [])
+            if not isinstance(hard_layers, list):
+                hard_layers = []
+            hard_dims = agg.get(hard_dk, [])
+            if not isinstance(hard_dims, list):
+                hard_dims = []
+            iqr_layers = agg.get(iqr_lk, [])
+            if not isinstance(iqr_layers, list):
+                iqr_layers = []
+            iqr_dims = agg.get(iqr_dk, [])
+            if not isinstance(iqr_dims, list):
+                iqr_dims = []
+            mass_layers = agg.get(mass_lk, [])
+            if not isinstance(mass_layers, list):
+                mass_layers = []
+            mass_dims = agg.get(mass_dk, [])
+            if not isinstance(mass_dims, list):
+                mass_dims = []
+            od_list = agg.get(_OUTLIERS_DETECTED, [])
+            if not isinstance(od_list, list):
+                od_list = []
+
+            def _b(lst: list[Any], i: int, default: Any = False) -> Any:
+                return lst[i] if i < len(lst) else default
+
+            def _layer_cell(lst: list[Any], i: int) -> str:
+                v = _b(lst, i, None)
+                return "" if v in (None, "") else str(v)
+
+            def _dim_cell(lst: list[Any], i: int) -> str | int:
+                v = _b(lst, i, None)
+                return "" if v is None else v
+
             for i, tok in enumerate(tokens):
+                s = bool(_b(soft_flags, i, False))
+                h = bool(_b(hard_flags, i, False))
+                iq = bool(_b(iqr_flags, i, False))
+                m = bool(_b(massive_flags, i, False))
+                od = (
+                    bool(_b(od_list, i, False))
+                    if isinstance(od_list, list)
+                    else _outliers_detected_row(s, h, iq, m)
+                )
                 rows.append(
                     {
                         "idx": i,
                         "token": tok,
                         "token_id": tids[i] if i < len(tids) else "",
-                        "layer": layers[i]
-                        if i < len(layers) and layers[i] is not None
-                        else "",
-                        "channel_dim": dims[i]
-                        if i < len(dims) and dims[i] is not None
-                        else "",
-                        "llm.int8() outliers soft difinition": (
-                            soft_flags[i] if i < len(soft_flags) else ""
-                        ),
-                        "llm.int8() outliers hard definition": (
-                            hard_flags[i] if i < len(hard_flags) else ""
-                        ),
-                        "interquantile_outliers": (
-                            iqr_flags[i] if i < len(iqr_flags) else ""
-                        ),
-                        "massive_activations": (
-                            massive_flags[i] if i < len(massive_flags) else ""
-                        ),
+                        "layer": _layer_cell(layers, i),
+                        "channel_dim": _dim_cell(dims, i),
+                        _SOFT_FLAG: s,
+                        soft_lk: _layer_cell(soft_layers, i),
+                        soft_dk: _dim_cell(soft_dims, i),
+                        _HARD_FLAG: h,
+                        hard_lk: _layer_cell(hard_layers, i),
+                        hard_dk: _dim_cell(hard_dims, i),
+                        _IQR_FLAG: iq,
+                        iqr_lk: _layer_cell(iqr_layers, i),
+                        iqr_dk: _dim_cell(iqr_dims, i),
+                        _MASS_FLAG: m,
+                        mass_lk: _layer_cell(mass_layers, i),
+                        mass_dk: _dim_cell(mass_dims, i),
+                        _OUTLIERS_DETECTED: od,
                     }
                 )
         self.dump_stats_root.mkdir(parents=True, exist_ok=True)
@@ -710,6 +981,44 @@ class _AnalyzerModel(nn.Module):
         self._log("finalizing analyzer output")
         self._dump_stats(draw_charts=self.draw_charts)
 
+    def _merge_modality_attribution(
+        self,
+        agg: dict[str, Any],
+        run: dict[str, Any],
+        layer_key: str,
+        dim_key: str,
+        agg_f: list[bool],
+        run_f: list[bool],
+        merged_f: list[bool],
+        n: int,
+    ) -> None:
+        def _pad(values: list[Any], fill: Any, size: int) -> list[Any]:
+            out = list(values)
+            if len(out) < size:
+                out.extend([fill] * (size - len(out)))
+            return out
+
+        agg_layer = _pad(list(agg.get(layer_key, [])), None, n)
+        run_layer = _pad(list(run.get(layer_key, [])), None, n)
+        agg_dim = _pad(list(agg.get(dim_key, [])), None, n)
+        run_dim = _pad(list(run.get(dim_key, [])), None, n)
+        ml: list[Any] = []
+        md: list[Any] = []
+        for i in range(n):
+            if not merged_f[i]:
+                ml.append(None)
+                md.append(None)
+            elif run_f[i]:
+                rl, rd = run_layer[i], run_dim[i]
+                al, ad = agg_layer[i], agg_dim[i]
+                ml.append(rl if rl not in (None, "") else al)
+                md.append(rd if rd is not None else ad)
+            else:
+                ml.append(agg_layer[i])
+                md.append(agg_dim[i])
+        agg[layer_key] = ml
+        agg[dim_key] = md
+
     def _merge_outliers_across_calls(self, run_outliers: dict[str, Any] | None) -> None:
         if run_outliers is None:
             return
@@ -793,8 +1102,6 @@ class _AnalyzerModel(nn.Module):
         for key, fill in (
             ("prompt_tokens", ""),
             ("prompt_token_ids", ""),
-            ("per_token_layer", None),
-            ("per_token_channel_dim", None),
         ):
             agg_vals = _pad(list(agg.get(key, [])), fill, n)
             run_vals = _pad(list(run_outliers.get(key, [])), fill, n)
@@ -806,29 +1113,57 @@ class _AnalyzerModel(nn.Module):
                     merged_vals.append(run_vals[i])
             agg[key] = merged_vals
 
+        self._merge_modality_attribution(
+            agg,
+            run_outliers,
+            _attribution_layer_key(_SOFT_FLAG),
+            _attribution_dim_key(_SOFT_FLAG),
+            agg_soft_flags,
+            run_soft_flags,
+            merged_soft_flags,
+            n,
+        )
+        self._merge_modality_attribution(
+            agg,
+            run_outliers,
+            _attribution_layer_key(_HARD_FLAG),
+            _attribution_dim_key(_HARD_FLAG),
+            agg_hard_flags,
+            run_hard_flags,
+            merged_hard_flags,
+            n,
+        )
+        self._merge_modality_attribution(
+            agg,
+            run_outliers,
+            _attribution_layer_key(_IQR_FLAG),
+            _attribution_dim_key(_IQR_FLAG),
+            agg_iqr_flags,
+            run_iqr_flags,
+            merged_iqr_flags,
+            n,
+        )
+        self._merge_modality_attribution(
+            agg,
+            run_outliers,
+            _attribution_layer_key(_MASS_FLAG),
+            _attribution_dim_key(_MASS_FLAG),
+            agg_massive_flags,
+            run_massive_flags,
+            merged_massive_flags,
+            n,
+        )
+
+        agg[_OUTLIERS_DETECTED] = _compute_outliers_detected_list(
+            merged_soft_flags,
+            merged_hard_flags,
+            merged_iqr_flags,
+            merged_massive_flags,
+        )
+
         _sync_outlier_attribution_columns(agg)
 
-        agg["table"] = _format_outlier_table_decoded(
-            tokens=[str(v) for v in agg.get("prompt_tokens", [])],
-            token_ids=[
-                int(v) if isinstance(v, int) else int(i)
-                for i, v in enumerate(agg.get("prompt_token_ids", []))
-            ],
-            soft_outliers=[
-                bool(v)
-                for v in agg.get("llm.int8() outliers soft difinition", [])
-            ],
-            hard_outliers=[
-                bool(v)
-                for v in agg.get("llm.int8() outliers hard definition", [])
-            ],
-            interquantile_outliers=[
-                bool(v) for v in agg.get("interquantile_outliers", [])
-            ],
-            massive_activations=[bool(v) for v in agg.get("massive_activations", [])],
-            layers=list(agg.get("per_token_layer", [])),
-            channel_dims=list(agg.get("per_token_channel_dim", [])),
-        )
+        agg["table"] = _format_outlier_table_from_payload(agg)
 
     def _dump_stats(self, draw_charts: bool = False) -> None:
         stats = self._build_stats()
@@ -902,37 +1237,9 @@ class _AnalyzerModel(nn.Module):
                     self._last_generate_outliers["token_trends"]["token_ids"] = (
                         token_ids
                     )
-                if "outliers" in self._last_generate_outliers:
-                    soft_flags = self._last_generate_outliers.get(
-                        "llm.int8() outliers soft difinition", []
-                    )
-                    hard_flags = self._last_generate_outliers.get(
-                        "llm.int8() outliers hard definition", []
-                    )
-                    iqr_flags = self._last_generate_outliers.get(
-                        "interquantile_outliers", []
-                    )
-                    massive_flags = self._last_generate_outliers.get(
-                        "massive_activations", []
-                    )
-                    layers = self._last_generate_outliers.get(
-                        "per_token_layer", [None] * len(decoded)
-                    )
-                    dims = self._last_generate_outliers.get(
-                        "per_token_channel_dim", [None] * len(decoded)
-                    )
-                    self._last_generate_outliers["table"] = (
-                        _format_outlier_table_decoded(
-                            tokens=decoded,
-                            token_ids=token_ids,
-                            soft_outliers=soft_flags,
-                            hard_outliers=hard_flags,
-                            interquantile_outliers=iqr_flags,
-                            massive_activations=massive_flags,
-                            layers=layers,
-                            channel_dims=dims,
-                        )
-                    )
+                self._last_generate_outliers["table"] = (
+                    _format_outlier_table_from_payload(self._last_generate_outliers)
+                )
 
         self._merge_outliers_across_calls(self._last_generate_outliers)
         self._last_generate_outliers = None
@@ -988,9 +1295,11 @@ class _AnalyzerModel(nn.Module):
         batch aggregate via `hard_mask.any(dim=0)`. Feature-dimension voting for charts
         uses another aggregation over layers.
 
-        `per_token_layer` / `per_token_channel_dim` are filled only when Acta's
-        token-level `outliers[i]` is true (then synced again by
-        `_sync_outlier_attribution_columns` after merges).
+        Legacy ``per_token_layer`` / ``per_token_channel_dim`` mirror **hard**
+        LLM-style flags only (synced from ``llm.int8() outliers hard definition_*``
+        columns). Each detection modality also gets parallel ``*_layer`` /
+        ``*_channel_dim`` lists (soft / hard / interquantile / massive). The boolean
+        ``outliers detected`` row is true when any modality fires for that token.
         """
         if not isinstance(generate_result, torch.Tensor) or generate_result.ndim != 2:
             return None
@@ -1138,19 +1447,50 @@ class _AnalyzerModel(nn.Module):
                     ten[:t_use, outlier_feature_dims].cpu().tolist()
                 )
 
+        soft_layer_attr: list[str | None] = [None] * int(use_len)
+        soft_dim_attr: list[int | None] = [None] * int(use_len)
+        neg_one_fs = torch.tensor(
+            -1.0, device=frac_stack.device, dtype=frac_stack.dtype
+        )
+        for ti in range(int(use_len)):
+            if not soft_outliers_list[ti]:
+                continue
+            sm_batch = soft_mask[:, ti]
+            if not bool(sm_batch.any().item()):
+                continue
+            masked_scores = torch.where(
+                sm_batch, frac_layers_affected[:, ti], neg_one_fs
+            )
+            b_pick = int(torch.argmax(masked_scores).item())
+            fr = frac_stack[:, b_pick, ti]
+            pos = fr > 0
+            if not bool(pos.any().item()):
+                continue
+            masked_fr = torch.where(pos, fr, neg_one_fs)
+            l_pick = int(torch.argmax(masked_fr).item())
+            ln = layer_names[l_pick]
+            soft_layer_attr[ti] = ln
+            ten_soft = self._run_max_abs_token_feature_by_layer.get(ln)
+            if ten_soft is not None and ti < ten_soft.shape[0]:
+                soft_dim_attr[ti] = int(torch.argmax(ten_soft[ti]).item())
+
         interquantile_outliers_list: list[bool] = [False] * int(use_len)
         massive_activations_list: list[bool] = [False] * int(use_len)
+        iqr_mask_full: torch.Tensor | None = None
+        massive_mask_full: torch.Tensor | None = None
+        max_abs_for_attrib: torch.Tensor | None = None
         if self._run_max_abs_token_feature is not None:
             t_feat = min(int(use_len), int(self._run_max_abs_token_feature.shape[0]))
             if t_feat > 0:
                 max_abs = self._run_max_abs_token_feature[:t_feat, :]  # [T, H]
+                max_abs_for_attrib = max_abs
                 q1 = torch.quantile(max_abs, 0.25, dim=0)
                 q3 = torch.quantile(max_abs, 0.75, dim=0)
                 iqr = q3 - q1
                 lower = q1 - 1.5 * iqr
                 upper = q3 + 1.5 * iqr
                 iqr_mask = (max_abs < lower) | (max_abs > upper)  # [T, H]
-                interquantile_outliers_list = iqr_mask.any(dim=1).cpu().tolist()
+                iqr_mask_full = iqr_mask
 
                 feature_prevalence = (
                     (max_abs >= float(self.outlier_threshold))
@@ -1159,7 +1499,47 @@ class _AnalyzerModel(nn.Module):
                 )  # [H]
                 rare_feature = feature_prevalence <= float(self.hard_seqdim_frac)
                 massive_mask = (max_abs >= float(self.outlier_threshold)) & rare_feature
+                massive_mask_full = massive_mask
+                interquantile_outliers_list = iqr_mask.any(dim=1).cpu().tolist()
                 massive_activations_list = massive_mask.any(dim=1).cpu().tolist()
+
+        iqr_layer_attr: list[str | None] = [None] * int(use_len)
+        iqr_dim_attr: list[int | None] = [None] * int(use_len)
+        massive_layer_attr: list[str | None] = [None] * int(use_len)
+        massive_dim_attr: list[int | None] = [None] * int(use_len)
+        if (
+            max_abs_for_attrib is not None
+            and iqr_mask_full is not None
+            and massive_mask_full is not None
+        ):
+            by_layer = self._run_max_abs_token_feature_by_layer
+            n_abs = int(max_abs_for_attrib.shape[0])
+            neg_ma = torch.tensor(
+                -1.0,
+                device=max_abs_for_attrib.device,
+                dtype=max_abs_for_attrib.dtype,
+            )
+            for ti in range(min(int(use_len), n_abs)):
+                if interquantile_outliers_list[ti]:
+                    row_iqr = iqr_mask_full[ti]
+                    if bool(row_iqr.any().item()):
+                        vals_iqr = torch.where(
+                            row_iqr, max_abs_for_attrib[ti], neg_ma
+                        )
+                        h_iqr = int(torch.argmax(vals_iqr).item())
+                        iqr_dim_attr[ti] = h_iqr
+                        iqr_layer_attr[ti] = _best_layer_for_hidden_dim(
+                            by_layer, ti, h_iqr
+                        )
+                if massive_activations_list[ti]:
+                    row_m = massive_mask_full[ti]
+                    if bool(row_m.any().item()):
+                        vals_m = torch.where(row_m, max_abs_for_attrib[ti], neg_ma)
+                        h_m = int(torch.argmax(vals_m).item())
+                        massive_dim_attr[ti] = h_m
+                        massive_layer_attr[ti] = _best_layer_for_hidden_dim(
+                            by_layer, ti, h_m
+                        )
 
         per_token_layer: list[str | None] = [None] * int(use_len)
         per_token_channel_dim: list[int | None] = [None] * int(use_len)
@@ -1201,16 +1581,38 @@ class _AnalyzerModel(nn.Module):
                 ]  # [T]
                 token_layer_max_magnitude.append(seq.cpu().tolist())
 
-        payload_outliers = {
-            "llm.int8() outliers soft difinition": soft_outliers_list,
-            "llm.int8() outliers hard definition": hard_outliers_list,
-            "interquantile_outliers": interquantile_outliers_list,
-            "massive_activations": massive_activations_list,
+        outliers_detected_list = _compute_outliers_detected_list(
+            soft_outliers_list,
+            hard_outliers_list,
+            interquantile_outliers_list,
+            massive_activations_list,
+        )
+
+        payload_outliers: dict[str, Any] = {
+            _SOFT_FLAG: soft_outliers_list,
+            _HARD_FLAG: hard_outliers_list,
+            _IQR_FLAG: interquantile_outliers_list,
+            _MASS_FLAG: massive_activations_list,
             "outliers": hard_outliers_list,
             "per_token_layer": per_token_layer,
             "per_token_channel_dim": per_token_channel_dim,
+            _attribution_layer_key(_SOFT_FLAG): soft_layer_attr,
+            _attribution_dim_key(_SOFT_FLAG): soft_dim_attr,
+            _attribution_layer_key(_HARD_FLAG): per_token_layer,
+            _attribution_dim_key(_HARD_FLAG): per_token_channel_dim,
+            _attribution_layer_key(_IQR_FLAG): iqr_layer_attr,
+            _attribution_dim_key(_IQR_FLAG): iqr_dim_attr,
+            _attribution_layer_key(_MASS_FLAG): massive_layer_attr,
+            _attribution_dim_key(_MASS_FLAG): massive_dim_attr,
+            _OUTLIERS_DETECTED: outliers_detected_list,
         }
         _sync_outlier_attribution_columns(payload_outliers)
+
+        tbl_src = {
+            **payload_outliers,
+            "prompt_tokens": decoded_tokens,
+            "prompt_token_ids": token_ids,
+        }
 
         return {
             "threshold": self.outlier_threshold,
@@ -1220,25 +1622,29 @@ class _AnalyzerModel(nn.Module):
             },
             "num_layers_considered": len(layer_names),
             "token_count": int(use_len),
-            "llm.int8() outliers soft difinition": soft_outliers_list,
-            "llm.int8() outliers hard definition": hard_outliers_list,
-            "interquantile_outliers": interquantile_outliers_list,
-            "massive_activations": massive_activations_list,
+            _SOFT_FLAG: soft_outliers_list,
+            _HARD_FLAG: hard_outliers_list,
+            _IQR_FLAG: interquantile_outliers_list,
+            _MASS_FLAG: massive_activations_list,
             "outliers": hard_outliers_list,
             "prompt_token_ids": token_ids,
             "prompt_tokens": decoded_tokens,
             "per_token_layer": payload_outliers["per_token_layer"],
             "per_token_channel_dim": payload_outliers["per_token_channel_dim"],
-            "table": _format_outlier_table_decoded(
-                tokens=decoded_tokens,
-                token_ids=token_ids,
-                soft_outliers=soft_outliers_list,
-                hard_outliers=hard_outliers_list,
-                interquantile_outliers=interquantile_outliers_list,
-                massive_activations=massive_activations_list,
-                layers=list(payload_outliers["per_token_layer"]),
-                channel_dims=list(payload_outliers["per_token_channel_dim"]),
-            ),
+            _attribution_layer_key(_SOFT_FLAG): soft_layer_attr,
+            _attribution_dim_key(_SOFT_FLAG): soft_dim_attr,
+            _attribution_layer_key(_HARD_FLAG): payload_outliers[
+                _attribution_layer_key(_HARD_FLAG)
+            ],
+            _attribution_dim_key(_HARD_FLAG): payload_outliers[
+                _attribution_dim_key(_HARD_FLAG)
+            ],
+            _attribution_layer_key(_IQR_FLAG): iqr_layer_attr,
+            _attribution_dim_key(_IQR_FLAG): iqr_dim_attr,
+            _attribution_layer_key(_MASS_FLAG): massive_layer_attr,
+            _attribution_dim_key(_MASS_FLAG): massive_dim_attr,
+            _OUTLIERS_DETECTED: outliers_detected_list,
+            "table": _format_outlier_table_from_payload(tbl_src),
             "token_trends": token_trends,
             "outlier_feature_dims": outlier_feature_dims,
             "token_feature_magnitude": token_feature_magnitude,

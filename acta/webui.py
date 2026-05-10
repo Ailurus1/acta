@@ -14,15 +14,24 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html
 import plotly.graph_objects as go
 import plotly.io as pio
 import numpy as np
+from PIL import Image
 from torch import nn
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoImageProcessor,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+)
 
 from acta import AutoAnalyzer
+from acta.target_layer_presets import format_preset_for_input
 _LOG_PATH = (Path.cwd() / ".acta_webui.log").resolve()
 
 _STATE: dict[str, Any] = {
     "model": None,
     "tokenizer": None,
+    "processor": None,
     "source": None,
     "task": None,
     "device": torch.device("cpu"),
@@ -125,14 +134,51 @@ def _to_device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, A
 
 
 def _sample_payload(source: str, task: str) -> str:
-    if source == "hf" and task == "causal-lm":
+    if source == "hf" and task == "text-generation":
         return "Hello, this is a sample prompt"
+    if source == "hf" and task == "masked-language-modeling":
+        return "This movie is fantastic and emotionally engaging."
+    if source == "hf" and task == "image-classification":
+        return (
+            '{"note": "Built-in dummy 224x224 image is used when payload is not JSON. '
+            'Optional: provide pixel_values as nested lists."}'
+        )
+    if source == "hf" and task == "automatic-speech-recognition":
+        return (
+            '{"note": "Built-in 1s silent waveform is used when payload is not JSON. '
+            'Optional keys: input_values, input_features (nested lists)."}'
+        )
     if source == "hf":
         return "This movie is fantastic and emotionally engaging."
     return json.dumps(
         {"input": [[0.1, -0.2, 0.3, 0.4]]},
         indent=2,
     )
+
+
+def _json_tensors_if_any(obj: Any, device: torch.device) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k == "note":
+            continue
+        if isinstance(v, list):
+            try:
+                out[k] = torch.tensor(v, dtype=torch.float32, device=device)
+            except Exception:
+                pass
+    return out
+
+
+def _whisper_decoder_seed(
+    model: nn.Module, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    cfg = getattr(model, "config", None)
+    ds = getattr(cfg, "decoder_start_token_id", None) if cfg is not None else None
+    if ds is None:
+        ds = 50258
+    return torch.full((batch_size, 1), int(ds), dtype=torch.long, device=device)
 
 
 def _csv_for_dash(csv_path: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -470,7 +516,8 @@ def create_app() -> Dash:
                 [
                     html.H2("ACTA", className="acta-title"),
                     html.P(
-                        "Load a model, then run activation analysis with interactive charts.",
+                        "Load a Hugging Face model (text-generation, masked LM, ViT, or ASR), "
+                        "then run activation analysis with interactive charts.",
                         className="acta-sub",
                     ),
                     html.Div(
@@ -487,14 +534,33 @@ def create_app() -> Dash:
                                 className="acta-row",
                             ),
                             html.P("Task", className="acta-label"),
-                            dcc.Dropdown(
-                                id="task",
-                                options=[
-                                    {"label": "Causal LM (generate)", "value": "causal-lm"},
-                                    {"label": "Encoder (forward)", "value": "encoder"},
+                            html.Div(
+                                [
+                                    dcc.Dropdown(
+                                        id="task",
+                                        options=[
+                                            {
+                                                "label": "text-generation",
+                                                "value": "text-generation",
+                                            },
+                                            {
+                                                "label": "masked-language-modeling",
+                                                "value": "masked-language-modeling",
+                                            },
+                                            {
+                                                "label": "image-classification (ViT)",
+                                                "value": "image-classification",
+                                            },
+                                            {
+                                                "label": "automatic-speech-recognition",
+                                                "value": "automatic-speech-recognition",
+                                            },
+                                        ],
+                                        value="text-generation",
+                                        clearable=False,
+                                    ),
                                 ],
-                                value="causal-lm",
-                                clearable=False,
+                                className="acta-field-darkblue",
                             ),
                             html.P("HuggingFace model id", className="acta-label"),
                             dcc.Input(
@@ -502,6 +568,8 @@ def create_app() -> Dash:
                                 type="text",
                                 placeholder="e.g. gpt2",
                                 value="gpt2",
+                                debounce=True,
+                                className="acta-field-darkblue",
                                 style={"width": "100%", "marginTop": "4px"},
                             ),
                             html.P("Local checkpoint path", className="acta-label"),
@@ -509,13 +577,18 @@ def create_app() -> Dash:
                                 id="local_path",
                                 type="text",
                                 placeholder="/path/to/model.pt",
+                                debounce=True,
+                                className="acta-field-darkblue",
                                 style={"width": "100%", "marginTop": "4px"},
                             ),
                             html.P("Target layers (optional)", className="acta-label"),
                             dcc.Input(
                                 id="target_layers",
                                 type="text",
-                                placeholder="e.g. transformer.h.*.mlp.c_fc",
+                                placeholder="Comma-separated globs/regex, e.g. transformer.h.*.mlp.c_fc",
+                                debounce=True,
+                                value=format_preset_for_input("gpt2"),
+                                className="acta-field-darkblue",
                                 style={"width": "100%", "marginTop": "4px"},
                             ),
                             html.P("Input payload", className="acta-label"),
@@ -528,7 +601,7 @@ def create_app() -> Dash:
                             ),
                             dcc.Textarea(
                                 id="payload",
-                                value=_sample_payload("hf", "causal-lm"),
+                                value=_sample_payload("hf", "text-generation"),
                                 style={
                                     "width": "100%",
                                     "height": "120px",
@@ -692,6 +765,13 @@ def create_app() -> Dash:
     def suggest_payload(_: int, source: str, task: str) -> str:
         return _sample_payload(source, task)
 
+    @app.callback(
+        Output("target_layers", "value"),
+        Input("hf_name", "value"),
+    )
+    def sync_target_layers_preset(hf_name: str | None) -> str:
+        return format_preset_for_input((hf_name or "").strip())
+
     def _model_key(source: str, task: str, hf_name: str, local_path: str) -> str:
         if source == "hf":
             return f"hf::{task}::{(hf_name or '').strip()}"
@@ -714,20 +794,46 @@ def create_app() -> Dash:
                     _log("load_model missing hf name")
                     return "Load failed", 0, "Please provide a HuggingFace model name."
                 _log("loading hf model name=%s task=%s", name, task)
-                if task == "causal-lm":
+                tokenizer = None
+                processor = None
+                if task == "text-generation":
                     model = AutoModelForCausalLM.from_pretrained(
                         name, dtype=torch.float32
                     )
-                else:
+                    tokenizer = AutoTokenizer.from_pretrained(name)
+                    _log("tokenizer loaded class=%s", tokenizer.__class__.__name__)
+                elif task == "masked-language-modeling":
                     model = AutoModel.from_pretrained(name, dtype=torch.float32)
+                    tokenizer = AutoTokenizer.from_pretrained(name)
+                    _log("tokenizer loaded class=%s", tokenizer.__class__.__name__)
+                elif task == "image-classification":
+                    model = AutoModel.from_pretrained(name, dtype=torch.float32)
+                    try:
+                        processor = AutoImageProcessor.from_pretrained(name)
+                        _log(
+                            "image_processor loaded class=%s",
+                            processor.__class__.__name__,
+                        )
+                    except Exception:
+                        processor = AutoProcessor.from_pretrained(name)
+                        _log("processor loaded class=%s", processor.__class__.__name__)
+                elif task == "automatic-speech-recognition":
+                    model = AutoModel.from_pretrained(name, dtype=torch.float32)
+                    processor = AutoProcessor.from_pretrained(name)
+                    _log("processor loaded class=%s", processor.__class__.__name__)
+                else:
+                    return (
+                        "Load failed",
+                        0,
+                        f"Unknown task {task!r}.",
+                    )
                 model = model.to(device).eval()
                 _log("model loaded class=%s device=%s", model.__class__.__name__, device)
-                tokenizer = AutoTokenizer.from_pretrained(name)
-                _log("tokenizer loaded class=%s", tokenizer.__class__.__name__)
                 _STATE.update(
                     {
                         "model": model,
                         "tokenizer": tokenizer,
+                        "processor": processor,
                         "source": source,
                         "task": task,
                         "device": device,
@@ -752,6 +858,7 @@ def create_app() -> Dash:
                 {
                     "model": model,
                     "tokenizer": None,
+                    "processor": None,
                     "source": source,
                     "task": task,
                     "device": device,
@@ -838,6 +945,7 @@ def create_app() -> Dash:
                 0,
             )
         tokenizer = _STATE.get("tokenizer")
+        processor = _STATE.get("processor")
         device = _STATE.get("device", torch.device("cpu"))
         _log(
             "run_analysis start source=%s task=%s model=%s device=%s payload_chars=%d",
@@ -857,7 +965,13 @@ def create_app() -> Dash:
                 draw_charts=False,
                 verbose=False,
                 tokenizer=tokenizer,
-                target_layers=(target_layers.strip() if target_layers and target_layers.strip() else None),
+                vit_reg_patch_labels=(task == "image-classification"),
+                asr_chunk_labels=(task == "automatic-speech-recognition"),
+                target_layers=(
+                    target_layers.strip()
+                    if target_layers and target_layers.strip()
+                    else None
+                ),
                 finalize_on_exit=False,
             )
             wrapped = wrapped.to(device)
@@ -865,22 +979,99 @@ def create_app() -> Dash:
             _log("wrapped model ready class=%s", wrapped.__class__.__name__)
             with torch.inference_mode():
                 if source == "hf":
-                    text = (payload_text or "").strip()
-                    if not text:
-                        _log("run_analysis hf empty payload")
-                        raise ValueError("Payload text is empty.")
-                    assert tokenizer is not None
-                    _log("tokenizing text len=%d", len(text))
-                    inputs = tokenizer(text, return_tensors="pt")
-                    inputs = _to_device_batch(dict(inputs), device=device)
-                    _log(
-                        "tokenized keys=%s summary=%s",
-                        list(inputs.keys()),
-                        {k: _tensor_brief(v) for k, v in inputs.items()},
-                    )
-                    _log("calling forward on wrapped model (safe mode, no generate)")
-                    wrapped(**inputs)
-                    _log("forward returned successfully")
+                    if task in ("text-generation", "masked-language-modeling"):
+                        text = (payload_text or "").strip()
+                        if not text:
+                            _log("run_analysis hf empty text payload")
+                            raise ValueError("Payload text is empty.")
+                        assert tokenizer is not None
+                        _log("tokenizing text len=%d", len(text))
+                        inputs = tokenizer(text, return_tensors="pt")
+                        inputs = _to_device_batch(dict(inputs), device=device)
+                        _log(
+                            "tokenized keys=%s summary=%s",
+                            list(inputs.keys()),
+                            {k: _tensor_brief(v) for k, v in inputs.items()},
+                        )
+                        _log("calling forward on wrapped model (safe mode, no generate)")
+                        wrapped(**inputs)
+                        _log("forward returned successfully")
+                    elif task == "image-classification":
+                        if processor is None:
+                            raise ValueError("No image processor in session.")
+                        pt = (payload_text or "").strip()
+                        inputs: dict[str, Any]
+                        if pt.startswith("{"):
+                            obj = json.loads(pt)
+                            tin = _json_tensors_if_any(obj, device=torch.device("cpu"))
+                            if "pixel_values" in tin:
+                                inputs = {
+                                    "pixel_values": tin["pixel_values"].to(device)
+                                }
+                            else:
+                                img = Image.new(
+                                    "RGB", (224, 224), color=(128, 128, 128)
+                                )
+                                inputs = dict(
+                                    processor(images=img, return_tensors="pt")
+                                )
+                        else:
+                            img = Image.new("RGB", (224, 224), color=(128, 128, 128))
+                            inputs = dict(processor(images=img, return_tensors="pt"))
+                        inputs = _to_device_batch(inputs, device=device)
+                        _log(
+                            "vision inputs keys=%s summary=%s",
+                            list(inputs.keys()),
+                            {k: _tensor_brief(v) for k, v in inputs.items()},
+                        )
+                        wrapped(**inputs)
+                        _log("vision forward returned successfully")
+                    elif task == "automatic-speech-recognition":
+                        if processor is None:
+                            raise ValueError("No audio processor in session.")
+                        pt = (payload_text or "").strip()
+                        if pt.startswith("{"):
+                            obj = json.loads(pt)
+                            tin = _json_tensors_if_any(obj, device=torch.device("cpu"))
+                            cand = {
+                                k: tin[k]
+                                for k in ("input_features", "input_values")
+                                if k in tin
+                            }
+                            if cand:
+                                inputs = _to_device_batch(cand, device=device)
+                            else:
+                                wav = np.zeros(16000, dtype=np.float32)
+                                inputs = dict(
+                                    processor(
+                                        wav, sampling_rate=16000, return_tensors="pt"
+                                    )
+                                )
+                                inputs = _to_device_batch(dict(inputs), device=device)
+                        else:
+                            wav = np.zeros(16000, dtype=np.float32)
+                            inputs = dict(
+                                processor(wav, sampling_rate=16000, return_tensors="pt")
+                            )
+                            inputs = _to_device_batch(dict(inputs), device=device)
+                        mt = getattr(model.config, "model_type", None)
+                        if mt == "whisper":
+                            if "input_features" in inputs:
+                                bsz = int(inputs["input_features"].shape[0])
+                            else:
+                                bsz = 1
+                            inputs["decoder_input_ids"] = _whisper_decoder_seed(
+                                model, bsz, device
+                            )
+                        _log(
+                            "asr inputs keys=%s summary=%s",
+                            list(inputs.keys()),
+                            {k: _tensor_brief(v) for k, v in inputs.items()},
+                        )
+                        wrapped(**inputs)
+                        _log("asr forward returned successfully")
+                    else:
+                        raise ValueError(f"Unsupported HuggingFace task: {task!r}")
                 else:
                     _log("parsing local payload json")
                     obj = json.loads(payload_text or "{}")
