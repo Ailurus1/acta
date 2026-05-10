@@ -8,7 +8,6 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +30,33 @@ def _pretty_layer_name(name: str) -> str:
     return ".".join(parts)
 
 
+def _upsample_grid_numpy(z: np.ndarray, up_x: int, up_y: int) -> np.ndarray:
+    if up_x <= 1 and up_y <= 1:
+        return z
+    y_sz, x_sz = z.shape
+    xp = np.arange(x_sz, dtype=np.float64)
+    xi = np.linspace(0.0, float(x_sz - 1), x_sz * up_x)
+    z_x = np.empty((y_sz, xi.shape[0]), dtype=z.dtype)
+    for i in range(y_sz):
+        z_x[i] = np.interp(xi, xp, z[i].astype(np.float64, copy=False))
+
+    yp = np.arange(y_sz, dtype=np.float64)
+    yi = np.linspace(0.0, float(y_sz - 1), y_sz * up_y)
+    z_xy = np.empty((yi.shape[0], z_x.shape[1]), dtype=z.dtype)
+    for j in range(z_x.shape[1]):
+        z_xy[:, j] = np.interp(yi, yp, z_x[:, j].astype(np.float64, copy=False))
+    return z_xy
+
+
 def _upsample_grid(z: np.ndarray, up_x: int = 6, up_y: int = 4) -> np.ndarray:
     if up_x <= 1 and up_y <= 1:
         return z
-    y, x = z.shape
-    x_old = np.arange(x)
-    x_new = np.linspace(0, x - 1, x * up_x)
-    z_x = np.vstack([np.interp(x_new, x_old, z_row) for z_row in z])
-    y_old = np.arange(y)
-    y_new = np.linspace(0, y - 1, y * up_y)
-    z_xy = np.vstack(
-        [np.interp(y_new, y_old, z_x[:, j]) for j in range(z_x.shape[1])]
-    ).T
-    return z_xy
+    try:
+        from scipy.ndimage import zoom
+
+        return zoom(z, (up_y, up_x), order=1)
+    except ImportError:
+        return _upsample_grid_numpy(z, up_x, up_y)
 
 
 def _chart_3d_token_limit(outliers: dict[str, Any]) -> int:
@@ -52,6 +65,17 @@ def _chart_3d_token_limit(outliers: dict[str, Any]) -> int:
         return max(4, int(v))
     except (TypeError, ValueError):
         return 24
+
+
+def _chart_token_trend_limit(outliers: dict[str, Any]) -> int:
+    """Max number of token-trend PNGs (defaults to chart_3d_max_tokens cap)."""
+    v = outliers.get("chart_token_trend_max_tokens")
+    if v is None:
+        return _chart_3d_token_limit(outliers)
+    try:
+        return max(1, int(v))
+    except (TypeError, ValueError):
+        return _chart_3d_token_limit(outliers)
 
 
 def _subsample_token_axis(
@@ -91,47 +115,61 @@ def _plot_token_trends(outliers: dict[str, Any], output_dir: Path) -> None:
     if not layer_names or not means or not variances or token_count <= 0:
         return
 
-    # means/variances are [num_layers][token_count]
     num_layers = len(layer_names)
     if len(means) != num_layers or len(variances) != num_layers:
+        return
+
+    means_arr = np.asarray(means, dtype=np.float32)
+    vars_arr = np.asarray(variances, dtype=np.float32)
+    if means_arr.shape != (num_layers, token_count):
+        return
+    if vars_arr.shape != (num_layers, token_count):
         return
 
     trend_dir = output_dir / "token_trends"
     trend_dir.mkdir(parents=True, exist_ok=True)
 
-    x = np.arange(num_layers)
-    for token_idx in range(token_count):
-        y = np.array(
-            [float(means[i][token_idx]) for i in range(num_layers)], dtype=np.float32
+    x = np.arange(num_layers, dtype=np.float32)
+    xtick_labels = [_pretty_layer_name(n) for n in layer_names]
+
+    max_plots = _chart_token_trend_limit(outliers)
+    if token_count > max_plots:
+        token_indices = np.linspace(
+            0, token_count - 1, max_plots, dtype=np.int64
         )
-        v = np.array(
-            [float(variances[i][token_idx]) for i in range(num_layers)],
-            dtype=np.float32,
-        )
-        std = np.sqrt(np.maximum(v, 0.0))
+    else:
+        token_indices = np.arange(token_count, dtype=np.int64)
+
+    fig_w = max(12.0, num_layers * 0.4)
+
+    for token_idx in token_indices:
+        ti = int(token_idx)
+        y = means_arr[:, ti]
+        vrow = vars_arr[:, ti]
+        std = np.sqrt(np.maximum(vrow, 0.0))
 
         tok_label = None
-        if isinstance(tokens, list) and token_idx < len(tokens):
-            tok_label = tokens[token_idx]
+        if isinstance(tokens, list) and ti < len(tokens):
+            tok_label = tokens[ti]
 
-        plt.figure(figsize=(max(12, num_layers * 0.4), 5))
-        sns.lineplot(x=x, y=y, marker="o", linewidth=2.0, color="#3366cc")
-        plt.fill_between(
+        fig, ax = plt.subplots(figsize=(fig_w, 5))
+        ax.plot(x, y, marker="o", linewidth=2.0, color="#3366cc")
+        ax.fill_between(
             x, y - std, y + std, alpha=0.2, color="#6699ff", label="mean +/- std"
         )
-        plt.xticks(
-            x, [_pretty_layer_name(n) for n in layer_names], rotation=45, ha="right"
-        )
-        plt.xlabel("Layer name")
-        plt.ylabel("Token mean activation (over hidden dims)")
-        title = f"Token idx {token_idx}: mean activation across layers"
+        ax.set_xticks(x)
+        ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
+        ax.set_xlabel("Layer name")
+        ax.set_ylabel("Token mean activation (over hidden dims)")
+        title = f"Token idx {ti}: mean activation across layers"
         if tok_label is not None:
             title = f"Token '{tok_label}': mean activation across layers"
-        plt.title(title)
-        plt.legend(loc="best")
-        plt.tight_layout()
-        plt.savefig(trend_dir / f"token_{token_idx}.png", dpi=150)
-        plt.close()
+        ax.set_title(title)
+        ax.legend(loc="best")
+        ax.grid(True, alpha=0.35)
+        fig.tight_layout()
+        fig.savefig(trend_dir / f"token_{ti}.png", dpi=150)
+        plt.close(fig)
 
 
 def _plot_outlier_token_feature_3d(outliers: dict[str, Any], output_dir: Path) -> None:
@@ -162,12 +200,16 @@ def _plot_outlier_token_feature_3d(outliers: dict[str, Any], output_dir: Path) -
     top_feat_idx = np.argsort(-max_per_feat)[:topk]
     top_feat_idx = np.sort(top_feat_idx)
 
-    feat_dims = [feat_dims[int(i)] for i in top_feat_idx]
+    feat_dims_sel = [feat_dims[int(i)] for i in top_feat_idx]
     mags = mags[:, top_feat_idx]  # [T, topk]
-    f = len(feat_dims)
+    f_plot = len(feat_dims_sel)
 
     mags_up = _upsample_grid(mags.T)  # [F_up, T_up]
     f_up, t_up = mags_up.shape
+
+    xticks = np.linspace(0, t_up - 1, token_count)
+    yticks = np.linspace(0, f_up - 1, f_plot)
+    feat_labels = [str(d) for d in feat_dims_sel]
 
     fig = plt.figure(figsize=(max(12, token_count * 0.6), 7))
     ax = fig.add_subplot(111, projection="3d")
@@ -176,10 +218,10 @@ def _plot_outlier_token_feature_3d(outliers: dict[str, Any], output_dir: Path) -
         X, Y, mags_up, rstride=1, cstride=1, color="royalblue", linewidth=1.5
     )
 
-    ax.set_xticks(np.linspace(0, t_up - 1, token_count))
+    ax.set_xticks(xticks)
     ax.set_xticklabels(tokens, rotation=50, ha="right")
-    ax.set_yticks(np.linspace(0, f_up - 1, f))
-    ax.set_yticklabels([str(d) for d in feat_dims])
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(feat_labels)
     ax.set_xlabel("Token", labelpad=20)
     ax.set_ylabel("Feature dim", labelpad=20)
     ax.set_zlabel("Magnitude (abs max over layers)", labelpad=20)
@@ -231,6 +273,8 @@ def _plot_outlier_token_feature_3d_per_layer(
         idx = np.linspace(0, len(tokens) - 1, max_3d, dtype=int)
         tokens_plot, _ = _subsample_token_axis(tokens, idx)
 
+    xticks_template = None
+
     for layer_name, magnitudes in mags_by_layer.items():
         if len(magnitudes) != len(tokens) or any(len(row) != f for row in magnitudes):
             continue
@@ -250,9 +294,14 @@ def _plot_outlier_token_feature_3d_per_layer(
 
         mags_up = _upsample_grid(mags_tf.T)  # [F_up, T_up]
         f_up, t_up = mags_up.shape
+        if xticks_template is None or xticks_template.shape[0] != t_plot:
+            xticks_template = np.linspace(0, t_up - 1, t_plot)
 
         pretty_layer = _pretty_layer_name(layer_name)
         fname_base = _sanitize_filename(pretty_layer)
+
+        feat_labels = [str(d) for d in feat_dims_top]
+        yticks = np.linspace(0, f_up - 1, len(feat_dims_top))
 
         fig = plt.figure(figsize=(max(12, t_plot * 0.6), 7))
         ax = fig.add_subplot(111, projection="3d")
@@ -263,10 +312,10 @@ def _plot_outlier_token_feature_3d_per_layer(
         ax.set_xlabel("Token", labelpad=20)
         ax.set_ylabel("Feature dim", labelpad=20)
         ax.set_zlabel("Magnitude (abs)", labelpad=20)
-        ax.set_xticks(np.linspace(0, t_up - 1, t_plot))
+        ax.set_xticks(xticks_template)
         ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
-        ax.set_yticks(np.linspace(0, f_up - 1, len(feat_dims_top)))
-        ax.set_yticklabels([str(d) for d in feat_dims_top])
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(feat_labels)
         ax.tick_params(axis="x", which="major")
         ax.tick_params(axis="y", which="major")
         ax.tick_params(axis="z", which="major")
@@ -289,14 +338,16 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     if not isinstance(trends, dict):
         return
 
-    tokens = trends.get("tokens", [])
-    layer_names = [_pretty_layer_name(n) for n in trends.get("layer_names", [])]
+    raw_layer_names = trends.get("layer_names", [])
     max_abs = trends.get("max_abs", None)  # [L][T]
-    if not tokens or not layer_names or max_abs is None:
+    tokens = trends.get("tokens", [])
+    if not tokens or not raw_layer_names or max_abs is None:
         return
 
+    layer_names_pretty = [_pretty_layer_name(n) for n in raw_layer_names]
+
     token_count = len(tokens)
-    layer_count = len(layer_names)
+    layer_count = len(layer_names_pretty)
     if token_count == 0 or layer_count == 0:
         return
     if len(max_abs) != layer_count or any(len(row) != token_count for row in max_abs):
@@ -318,11 +369,15 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     if keep.size == 0:
         keep = np.arange(layer_count)
     mags = mags[keep, :]
-    layer_names = [layer_names[int(i)] for i in keep]
-    layer_count = len(layer_names)
+    layer_names_plot = [layer_names_pretty[int(i)] for i in keep]
+    layer_count = len(layer_names_plot)
 
     mags_up = _upsample_grid(mags, up_x=6, up_y=2)  # [L_up, T_up]
     l_up, t_up = mags_up.shape
+
+    xticks = np.linspace(0, t_up - 1, token_count)
+    yticks = np.linspace(0, l_up - 1, layer_count)
+
     fig = plt.figure(figsize=(max(12, token_count * 0.6), max(7, layer_count * 0.35)))
     ax = fig.add_subplot(111, projection="3d")
     X, Y = np.meshgrid(np.arange(t_up), np.arange(l_up))
@@ -332,10 +387,10 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     ax.set_xlabel("Token", labelpad=25)
     ax.set_ylabel("Layer")
     ax.set_zlabel("Max |activation| over hidden dims")
-    ax.set_xticks(np.linspace(0, t_up - 1, token_count))
+    ax.set_xticks(xticks)
     ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
-    ax.set_yticks(np.linspace(0, l_up - 1, layer_count))
-    ax.set_yticklabels(layer_names)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(layer_names_plot)
     ax.tick_params(axis="x", which="major", pad=-4)
     ax.tick_params(axis="y", which="major", pad=-5)
     ax.tick_params(axis="z", which="major", pad=-1)
@@ -362,15 +417,18 @@ def _plot_layer_channel_hist(layers: dict[str, Any], output_dir: Path) -> None:
         if not means:
             continue
 
-        channel_idx = np.arange(len(means))
-        plt.figure(figsize=(max(10, len(means) * 0.2), 5))
-        sns.barplot(x=channel_idx, y=np.array(means, dtype=np.float32), color="#44aa99")
-        plt.xlabel("Channel index in layer")
-        plt.ylabel("Mean activation")
-        plt.title(f"{layer_name}: channel mean activations")
-        plt.tight_layout()
-        plt.savefig(hist_dir / f"{_sanitize_filename(layer_name)}.png", dpi=150)
-        plt.close()
+        y = np.asarray(means, dtype=np.float32)
+        channel_idx = np.arange(len(means), dtype=np.float32)
+
+        fig, ax = plt.subplots(figsize=(max(10, len(means) * 0.2), 5))
+        ax.bar(channel_idx, y, width=1.0, color="#44aa99", align="center")
+        ax.set_xlabel("Channel index in layer")
+        ax.set_ylabel("Mean activation")
+        ax.set_title(f"{layer_name}: channel mean activations")
+        ax.grid(True, axis="y", alpha=0.35)
+        fig.tight_layout()
+        fig.savefig(hist_dir / f"{_sanitize_filename(layer_name)}.png", dpi=150)
+        plt.close(fig)
 
 
 def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
@@ -380,18 +438,24 @@ def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
     outliers = stats.get("outliers", {})
 
     logger.info("[acta] creating charts in: %s", output_dir)
+    rc = {
+        "axes.grid": True,
+        "grid.alpha": 0.35,
+        "axes.facecolor": "white",
+        "figure.facecolor": "white",
+    }
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        sns.set_theme(style="whitegrid")
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
+        with plt.rc_context(rc):
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
 
-        if isinstance(outliers, dict):
-            _plot_token_trends(outliers, out)
-            _plot_outlier_token_feature_3d(outliers, out)
-            _plot_outlier_token_feature_3d_per_layer(outliers, out)
-            _plot_token_layer_3d(outliers, out)
-        _plot_layer_channel_hist(layers, out)
+            if isinstance(outliers, dict):
+                _plot_token_trends(outliers, out)
+                _plot_outlier_token_feature_3d(outliers, out)
+                _plot_outlier_token_feature_3d_per_layer(outliers, out)
+                _plot_token_layer_3d(outliers, out)
+            _plot_layer_channel_hist(layers, out)
 
 
 def build_charts_from_stats_file(
