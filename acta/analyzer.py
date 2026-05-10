@@ -157,6 +157,33 @@ def _format_outlier_table_decoded(
     return "\n".join(lines)
 
 
+def _sync_outlier_attribution_columns(payload: dict[str, Any]) -> None:
+    flags = payload.get("outliers")
+    if not isinstance(flags, list):
+        return
+    layers = payload.get("per_token_layer")
+    dims = payload.get("per_token_channel_dim")
+    if not isinstance(layers, list):
+        layers = []
+    if not isinstance(dims, list):
+        dims = []
+    n = len(flags)
+    while len(layers) < n:
+        layers.append(None)
+    while len(dims) < n:
+        dims.append(None)
+    if len(layers) > n:
+        layers[:] = layers[:n]
+    if len(dims) > n:
+        dims[:] = dims[:n]
+    for i in range(n):
+        if not bool(flags[i]):
+            layers[i] = None
+            dims[i] = None
+    payload["per_token_layer"] = layers
+    payload["per_token_channel_dim"] = dims
+
+
 def decode_token(tokenizer: Any, token_id: int) -> str:
     if tokenizer is None:
         return str(token_id)
@@ -556,6 +583,7 @@ class _AnalyzerModel(nn.Module):
             return
         if self._aggregate_generate_outliers is None:
             self._aggregate_generate_outliers = copy.deepcopy(run_outliers)
+            _sync_outlier_attribution_columns(self._aggregate_generate_outliers)
             self._log("initialized outlier aggregation state")
             return
 
@@ -594,6 +622,8 @@ class _AnalyzerModel(nn.Module):
                 else:
                     merged_vals.append(run_vals[i])
             agg[key] = merged_vals
+
+        _sync_outlier_attribution_columns(agg)
 
         agg["table"] = _format_outlier_table_decoded(
             tokens=[str(v) for v in agg.get("prompt_tokens", [])],
@@ -724,6 +754,25 @@ class _AnalyzerModel(nn.Module):
     def _detect_outliers_after_generate(
         self, generate_result: Any, prompt_len: int | None
     ) -> dict[str, Any] | None:
+        """
+        Token-level ``outliers`` and attribution columns are **Acta** summaries, not a
+        verbatim copy of bitsandbytes LLM.int8() mixed matmul routing.
+
+        Reference (bitsandbytes): `Linear8bitLt` uses `state.threshold` on layer
+        inputs; ``bitsandbytes::int8_vectorwise_quant`` builds ``outlier_cols`` where
+        `(A.abs() >= threshold).any(dim=0)` over all leading dimensions (see
+        `bitsandbytes/backends/default/ops.py`). That is **column-global** per Linear.
+
+        Acta: per hooked layer we compute each token's fraction of hidden dims with
+        `|x| >= outlier_threshold`, require `hard_seqdim_frac` per layer, then for
+        each token require at least `hard_layers_frac` of layers to pass --- optional
+        batch aggregate via `hard_mask.any(dim=0)`. Feature-dimension voting for charts
+        uses another aggregation over layers.
+
+        `per_token_layer` / `per_token_channel_dim` are filled only when Acta's
+        token-level `outliers[i]` is true (then synced again by
+        `_sync_outlier_attribution_columns` after merges).
+        """
         if not isinstance(generate_result, torch.Tensor) or generate_result.ndim != 2:
             return None
 
@@ -873,6 +922,8 @@ class _AnalyzerModel(nn.Module):
             t_feat = min(int(use_len), int(self._run_max_abs_token_feature.shape[0]))
             max_abs = self._run_max_abs_token_feature[:t_feat, :]  # [T, H]
             for ti in range(int(t_feat)):
+                if ti >= len(outliers_list) or not outliers_list[ti]:
+                    continue
                 vals = max_abs[ti, outlier_feature_dims]
                 if vals.numel() == 0:
                     continue
@@ -905,6 +956,13 @@ class _AnalyzerModel(nn.Module):
                 ]  # [T]
                 token_layer_max_magnitude.append(seq.cpu().tolist())
 
+        payload_outliers = {
+            "outliers": outliers_list,
+            "per_token_layer": per_token_layer,
+            "per_token_channel_dim": per_token_channel_dim,
+        }
+        _sync_outlier_attribution_columns(payload_outliers)
+
         return {
             "threshold": self.outlier_threshold,
             "hard_criteria": {
@@ -916,14 +974,14 @@ class _AnalyzerModel(nn.Module):
             "outliers": outliers_list,
             "prompt_token_ids": token_ids,
             "prompt_tokens": decoded_tokens,
-            "per_token_layer": per_token_layer,
-            "per_token_channel_dim": per_token_channel_dim,
+            "per_token_layer": payload_outliers["per_token_layer"],
+            "per_token_channel_dim": payload_outliers["per_token_channel_dim"],
             "table": _format_outlier_table_decoded(
                 tokens=decoded_tokens,
                 token_ids=token_ids,
                 outliers=outliers_list,
-                layers=per_token_layer,
-                channel_dims=per_token_channel_dim,
+                layers=list(payload_outliers["per_token_layer"]),
+                channel_dims=list(payload_outliers["per_token_channel_dim"]),
             ),
             "token_trends": token_trends,
             "outlier_feature_dims": outlier_feature_dims,

@@ -19,6 +19,7 @@ from transformers import (
 )
 
 from acta import AutoAnalyzer
+from acta.analyzer import _sync_outlier_attribution_columns
 
 ModelBuilder = Callable[[], nn.Module]
 InputBuilder = Callable[[], dict[str, Any]]
@@ -363,3 +364,78 @@ def test_batched_inference_creates_valid_stats_and_outliers(
         token_count = int(outliers.get("token_count", 0))
         flags = outliers.get("outliers", [])
         assert len(flags) == token_count
+
+
+def test_sync_outlier_attribution_columns_clears_when_flag_false() -> None:
+    payload = {
+        "outliers": [False, True, False],
+        "per_token_layer": ["bad.layer", "good.layer", "also.bad"],
+        "per_token_channel_dim": [1, 7, 9],
+    }
+    _sync_outlier_attribution_columns(payload)
+    assert payload["per_token_layer"][0] is None
+    assert payload["per_token_channel_dim"][0] is None
+    assert payload["per_token_layer"][1] == "good.layer"
+    assert payload["per_token_channel_dim"][1] == 7
+    assert payload["per_token_layer"][2] is None
+    assert payload["per_token_channel_dim"][2] is None
+
+
+def test_merge_outliers_drops_stale_layer_when_flags_false(tmp_path: Path) -> None:
+    """Merge prefers non-null agg layer; sync must clear if merged outliers are False."""
+    base = nn.Linear(4, 4)
+    wrapped = AutoAnalyzer(
+        base,
+        dump_stats_path=str(tmp_path / "merge_sync"),
+        verbose=False,
+        target_layers="*",
+    )
+    wrapped._aggregate_generate_outliers = {
+        "outliers": [False],
+        "token_count": 1,
+        "prompt_tokens": ["x"],
+        "prompt_token_ids": [0],
+        "per_token_layer": ["stale.layer"],
+        "per_token_channel_dim": [99],
+    }
+    wrapped._merge_outliers_across_calls(
+        {
+            "outliers": [False],
+            "token_count": 1,
+            "prompt_tokens": ["x"],
+            "prompt_token_ids": [0],
+            "per_token_layer": [None],
+            "per_token_channel_dim": [None],
+        }
+    )
+    agg = wrapped._aggregate_generate_outliers
+    assert agg is not None
+    assert agg["outliers"] == [False]
+    assert agg["per_token_layer"] == [None]
+    assert agg["per_token_channel_dim"] == [None]
+
+
+def test_stats_outlier_columns_consistent_after_generate(tmp_path: Path) -> None:
+    wrapped, stats = _run_case(
+        tmp_path,
+        "consistency",
+        _gpt2_builder,
+        _gpt2_input,
+        _gpt2_run,
+        draw_charts=False,
+        num_calls=1,
+    )
+    _ = wrapped
+    out = stats.get("outliers", {})
+    if not isinstance(out, dict):
+        return
+    flags = out.get("outliers", [])
+    layers = out.get("per_token_layer", [])
+    dims = out.get("per_token_channel_dim", [])
+    if not flags:
+        return
+    n = min(len(flags), len(layers), len(dims))
+    for i in range(n):
+        if not bool(flags[i]):
+            assert layers[i] in (None, "")
+            assert dims[i] in (None, "")
