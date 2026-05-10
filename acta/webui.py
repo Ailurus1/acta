@@ -138,23 +138,6 @@ def _img_data_uri(path: Path) -> str | None:
 
 def _build_3d_gallery(run_dir: Path) -> list[Any]:
     items: list[Any] = []
-    main_3d = [
-        run_dir / "outlier_token_feature_3d.png",
-        run_dir / "token_layer_maxabs_3d.png",
-    ]
-    for p in main_3d:
-        src = _img_data_uri(p)
-        if src is None:
-            continue
-        items.append(
-            html.Div(
-                [
-                    html.P(p.name, className="acta-label"),
-                    html.Img(src=src, className="acta-chart-img"),
-                ],
-                className="acta-chart-card",
-            )
-        )
     per_layer = run_dir / "outlier_token_feature_3d_per_layer"
     if per_layer.exists():
         shown = 0
@@ -177,6 +160,20 @@ def _build_3d_gallery(run_dir: Path) -> list[Any]:
     if not items:
         return [html.P("No visualizer 3D charts generated for this run.", className="acta-sub")]
     return items
+
+
+def _image_block(title: str, src: str | None) -> list[Any]:
+    if not src:
+        return [html.P(f"{title}: not available for this run.", className="acta-sub")]
+    return [
+        html.Div(
+            [
+                html.P(title, className="acta-label"),
+                html.Img(src=src, className="acta-chart-img"),
+            ],
+            className="acta-chart-card",
+        )
+    ]
 
 
 def _apply_dark(fig: go.Figure) -> go.Figure:
@@ -381,47 +378,85 @@ def create_app() -> Dash:
                         ],
                         className="acta-card",
                     ),
+                ],
+                className="acta-col-left",
+            ),
+            html.Div(
+                [
                     html.Div(
                         [
-                            dcc.Graph(id="fig_layer", config={"scrollZoom": True}),
-                            dcc.Graph(id="fig_heatmap", config={"scrollZoom": True}),
-                            dcc.Graph(id="fig_outliers", config={"scrollZoom": True}),
-                            html.H4("CSV Results", className="acta-h4"),
-                            dash_table.DataTable(
-                                id="csv-table",
-                                columns=[],
-                                data=[],
-                                style_table={"overflowX": "auto"},
-                                style_header={
-                                    "backgroundColor": "rgba(56,189,248,0.18)",
-                                    "color": "#e8ecf4",
-                                    "fontWeight": "700",
-                                    "border": "1px solid rgba(148,163,184,0.22)",
-                                },
-                                style_cell={
-                                    "backgroundColor": "rgba(15,23,42,0.5)",
-                                    "color": "#e8ecf4",
-                                    "border": "1px solid rgba(148,163,184,0.16)",
-                                    "fontFamily": "JetBrains Mono, monospace",
-                                    "fontSize": "12px",
-                                    "padding": "6px",
-                                    "textAlign": "left",
-                                    "maxWidth": 260,
-                                    "whiteSpace": "normal",
-                                },
-                                page_size=15,
-                            ),
-                            html.H4("Outlier table", className="acta-h4"),
-                            html.Pre(id="table", className="acta-table-wrap"),
-                            html.H4("Visualizer 3D charts", className="acta-h4"),
-                            html.Div(id="viz-3d", className="acta-chart-grid"),
+                            dcc.Tabs(
+                                id="results-tabs",
+                                value="csv",
+                                children=[
+                                    dcc.Tab(
+                                        label="CSV Results",
+                                        value="csv",
+                                        children=[
+                                            dash_table.DataTable(
+                                                id="csv-table",
+                                                columns=[],
+                                                data=[],
+                                                style_table={"overflowX": "auto"},
+                                                style_header={
+                                                    "backgroundColor": "rgba(56,189,248,0.18)",
+                                                    "color": "#e8ecf4",
+                                                    "fontWeight": "700",
+                                                    "border": "1px solid rgba(148,163,184,0.22)",
+                                                },
+                                                style_cell={
+                                                    "backgroundColor": "rgba(15,23,42,0.5)",
+                                                    "color": "#e8ecf4",
+                                                    "border": "1px solid rgba(148,163,184,0.16)",
+                                                    "fontFamily": "JetBrains Mono, monospace",
+                                                    "fontSize": "12px",
+                                                    "padding": "6px",
+                                                    "textAlign": "left",
+                                                    "maxWidth": 260,
+                                                    "whiteSpace": "normal",
+                                                },
+                                                page_size=15,
+                                            ),
+                                            html.H4("Outlier table", className="acta-h4"),
+                                            html.Pre(id="table", className="acta-table-wrap"),
+                                        ],
+                                    ),
+                                    dcc.Tab(
+                                        label="outlier token feature 3d",
+                                        value="outlier3d",
+                                        children=[html.Div(id="tab-outlier3d", className="acta-chart-grid")],
+                                    ),
+                                    dcc.Tab(
+                                        label="token layer maxabs 3d",
+                                        value="layermax3d",
+                                        children=[html.Div(id="tab-layermax3d", className="acta-chart-grid")],
+                                    ),
+                                    dcc.Tab(
+                                        label="feature magnitudes per-layer",
+                                        value="perlayer3d",
+                                        children=[html.Div(id="tab-perlayer3d", className="acta-chart-grid")],
+                                    ),
+                                    dcc.Tab(
+                                        label="per-layer mean activations",
+                                        value="means",
+                                        children=[dcc.Graph(id="fig_layer", config={"scrollZoom": True})],
+                                    ),
+                                    dcc.Tab(
+                                        label="token trends (mean) heatmap",
+                                        value="heatmap",
+                                        children=[dcc.Graph(id="fig_heatmap", config={"scrollZoom": True})],
+                                    ),
+                                ],
+                            )
                         ],
                         className="acta-card",
-                    ),
+                    )
                 ],
-                className="acta-shell",
+                className="acta-col-right",
             ),
         ]
+        ,
+        className="acta-shell acta-layout",
     )
 
     @app.callback(
@@ -513,11 +548,12 @@ def create_app() -> Dash:
     @app.callback(
         Output("fig_layer", "figure"),
         Output("fig_heatmap", "figure"),
-        Output("fig_outliers", "figure"),
         Output("csv-table", "data"),
         Output("csv-table", "columns"),
         Output("table", "children"),
-        Output("viz-3d", "children"),
+        Output("tab-outlier3d", "children"),
+        Output("tab-layermax3d", "children"),
+        Output("tab-perlayer3d", "children"),
         Output("status", "children", allow_duplicate=True),
         Output("progress-title", "children", allow_duplicate=True),
         Output("progress", "value", allow_duplicate=True),
@@ -549,10 +585,11 @@ def create_app() -> Dash:
     ) -> tuple[
         Any,
         Any,
-        Any,
         list[dict[str, Any]],
         list[dict[str, str]],
         str,
+        list[Any],
+        list[Any],
         list[Any],
         str,
         str,
@@ -567,10 +604,11 @@ def create_app() -> Dash:
             return (
                 empty,
                 empty,
-                empty,
                 [],
                 [],
                 "",
+                [],
+                [],
                 [],
                 load_msg,
                 "Stage 1/3 failed: model load",
@@ -659,11 +697,18 @@ def create_app() -> Dash:
             return (
                 _fig_layer_means(stats),
                 _fig_token_layer_heatmap(stats),
-                _fig_outlier_flags(stats),
                 csv_rows,
                 csv_cols,
                 table,
-                viz_children,
+                _image_block(
+                    "outlier_token_feature_3d.png",
+                    _img_data_uri(run_dir / "outlier_token_feature_3d.png"),
+                ),
+                _image_block(
+                    "token_layer_maxabs_3d.png",
+                    _img_data_uri(run_dir / "token_layer_maxabs_3d.png"),
+                ),
+                _build_3d_gallery(run_dir),
                 f"{load_msg}\nAnalysis complete. Stats: {wrapped.dump_stats_path}",
                 "Stage 3/3 complete: charts built",
                 100,
@@ -674,10 +719,11 @@ def create_app() -> Dash:
             return (
                 empty,
                 empty,
-                empty,
                 [],
                 [],
                 "",
+                [],
+                [],
                 [],
                 f"Run failed: {e}",
                 "Stage 2/3 failed: inference",

@@ -1,4 +1,3 @@
-/* Dash serves files from acta/assets/ when running acta.webui */
 :root {
   --bg0: #0b1020;
   --bg1: #12182c;
@@ -31,6 +30,18 @@ body {
   max-width: 1180px;
   margin: 0 auto;
   padding: 28px 24px 48px;
+}
+
+.acta-layout {
+  display: grid;
+  grid-template-columns: minmax(340px, 420px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.acta-col-left,
+.acta-col-right {
+  min-width: 0;
 }
 
 .acta-title {
@@ -199,6 +210,18 @@ button.acta-btn-run:hover {
 .acta-card .Select-placeholder,
 .acta-card .Select-arrow-zone,
 .acta-card .Select-arrow {
+  color: var(--text) !important;
+}
+
+.acta-card .tab {
+  background: rgba(15, 23, 42, 0.65) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+}
+
+.acta-card .tab--selected {
+  background: rgba(56, 189, 248, 0.18) !important;
+  border-color: rgba(56, 189, 248, 0.55) !important;
   color: var(--text) !important;
 }
 
