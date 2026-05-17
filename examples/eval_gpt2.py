@@ -16,7 +16,7 @@ def main() -> None:
     device = _preferred_device()
     model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2").to(device)
     tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
-
+    print(model)
     model = AutoAnalyzer(
         model,
         tokenizer=tokenizer,

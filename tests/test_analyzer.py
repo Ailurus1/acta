@@ -19,7 +19,7 @@ from transformers import (
 )
 
 from acta import AutoAnalyzer
-from acta.analyzer import _sync_outlier_attribution_columns
+from acta.analyzer import _IQR_FLAG, _SOFT_FLAG, _sync_outlier_attribution_columns
 
 ModelBuilder = Callable[[], nn.Module]
 InputBuilder = Callable[[], dict[str, Any]]
@@ -323,14 +323,61 @@ def test_eval_models_create_all_charts(
     wrapped._finalize_on_exit()
     run_dir = Path(wrapped.output_run_dir)
 
-    assert (run_dir / "layer_channel_hist").exists()
-    assert list((run_dir / "layer_channel_hist").glob("*.png"))
-    assert (run_dir / "token_trends").exists()
-    assert list((run_dir / "token_trends").glob("*.png"))
+    assert not (run_dir / "layer_channel_hist").exists()
+    assert not (run_dir / "token_trends").exists()
+    op_dir = run_dir / "operator_activation_tops"
+    assert op_dir.exists()
+    assert list(op_dir.glob("*.png"))
+    assert (run_dir / "operator_max_kurtosis_across_blocks.png").exists()
+    assert (run_dir / "operator_max_median_ratio_across_blocks.png").exists()
     assert (run_dir / "outlier_token_feature_3d.png").exists()
-    assert (run_dir / "token_layer_maxabs_3d.png").exists()
+    maxabs_dir = run_dir / "token_layer_maxabs_3d"
+    assert maxabs_dir.is_dir()
+    assert list(maxabs_dir.glob("*.png"))
+    assert not (run_dir / "token_layer_maxabs_3d.png").exists()
     assert (run_dir / "outlier_token_feature_3d_per_layer").exists()
     assert list((run_dir / "outlier_token_feature_3d_per_layer").glob("*.png"))
+
+
+def test_draw_token_trends_flag_creates_token_trend_charts(tmp_path: Path) -> None:
+    torch.manual_seed(42)
+    wrapped = AutoAnalyzer(
+        _gpt2_builder(),
+        dump_stats_path=str(tmp_path / "token_trends_on"),
+        target_layers=None,
+        draw_charts=True,
+        draw_token_trends=True,
+        verbose=False,
+        tokenizer=None,
+        outlier_threshold=0.0,
+    )
+    wrapped.eval()
+    _gpt2_run(wrapped, _gpt2_input())
+    wrapped._finalize_on_exit()
+    run_dir = Path(wrapped.output_run_dir)
+    assert (run_dir / "token_trends").exists()
+    assert list((run_dir / "token_trends").glob("*.png"))
+
+
+def test_finalize_prints_outlier_table_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    wrapped = AutoAnalyzer(
+        _gpt2_builder(),
+        dump_stats_path=str(tmp_path / "stdout_table"),
+        target_layers=None,
+        draw_charts=False,
+        verbose=False,
+        tokenizer=None,
+        outlier_threshold=0.0,
+    )
+    wrapped.eval()
+    _gpt2_run(wrapped, _gpt2_input())
+    wrapped._finalize_on_exit()
+    captured = capsys.readouterr().out
+    assert "idx" in captured and "token" in captured and "outliers detected" in captured
+    assert "llm.int8() outliers soft difinition" not in captured
+    assert "per_token_max_kurtosis" not in captured
 
 
 @pytest.mark.parametrize("case_name,model_builder,input_builder,run_fn", BATCH_CASES)
@@ -440,7 +487,9 @@ def test_stats_outlier_columns_consistent_after_generate(tmp_path: Path) -> None
             assert dims[i] in (None, "")
 
 
-def test_stats_include_soft_hard_iqr_massive_columns(tmp_path: Path) -> None:
+def test_stats_include_soft_hard_iqr_columns_and_activation_report(
+    tmp_path: Path,
+) -> None:
     wrapped, stats = _run_case(
         tmp_path,
         "new_metrics",
@@ -457,13 +506,12 @@ def test_stats_include_soft_hard_iqr_massive_columns(tmp_path: Path) -> None:
     soft = out.get("llm.int8() outliers soft difinition", [])
     hard = out.get("llm.int8() outliers hard definition", [])
     iqr = out.get("interquantile_outliers", [])
-    massive = out.get("massive_activations", [])
     token_count = int(out.get("token_count", 0))
 
     assert len(soft) == token_count
     assert len(hard) == token_count
     assert len(iqr) == token_count
-    assert len(massive) == token_count
+    assert "massive_activations" not in out
 
     detected = out.get("outliers detected", [])
     assert isinstance(detected, list)
@@ -471,7 +519,36 @@ def test_stats_include_soft_hard_iqr_massive_columns(tmp_path: Path) -> None:
     assert len(out.get("llm.int8() outliers soft difinition_layer", [])) == token_count
 
     table = str(out.get("table", ""))
-    assert "idx" in table and "token" in table
-    assert "soft" in table and "hard" in table
-    assert "iqr" in table and "mass" in table
-    assert "any" in table
+    assert "idx" in table and "token" in table and "outliers detected" in table
+    assert _SOFT_FLAG not in table
+    assert "interquantile_outliers" not in table
+    assert "per_token_max_kurtosis" not in table
+    assert "per_token_max_median_ratio" not in table
+    assert "mass" not in table
+
+    assert "per_token_max_kurtosis" not in out
+    assert "per_token_max_median_ratio" not in out
+
+    report = stats.get("report", {})
+    assert isinstance(report, dict)
+    assert "max_median_ratio" in report
+    assert "kurtosis" in report
+    abs_tops = report.get("activation_abs", {})
+    assert isinstance(abs_tops, dict)
+    for key in (
+        "top_1",
+        "top_2",
+        "top_3",
+        "top_10",
+        "top_p01",
+        "top_p10",
+        "top_p50",
+        "top_p90",
+        "top_p99",
+    ):
+        assert key in abs_tops
+
+    first_layer = next(iter(stats["layers"].values()))
+    kurt = first_layer.get("kurtosis", [])
+    assert isinstance(kurt, list) and kurt
+    assert any(v is not None for v in kurt)

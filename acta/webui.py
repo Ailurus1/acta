@@ -477,7 +477,6 @@ def _fig_outlier_flags(stats: dict[str, Any]) -> go.Figure:
         for v in out.get("llm.int8() outliers soft difinition", [])
     ]
     iqr = [1 if bool(v) else 0 for v in out.get("interquantile_outliers", [])]
-    massive = [1 if bool(v) else 0 for v in out.get("massive_activations", [])]
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(x=x, y=soft, mode="lines+markers", name="soft", line={"color": "#94a3b8"})
@@ -487,11 +486,6 @@ def _fig_outlier_flags(stats: dict[str, Any]) -> go.Figure:
     )
     fig.add_trace(
         go.Scatter(x=x, y=iqr, mode="lines+markers", name="iqr", line={"color": "#a78bfa"})
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=massive, mode="lines+markers", name="massive", line={"color": "#34d399"}
-        )
     )
     fig.update_layout(title="Outlier flags per token", yaxis={"tickvals": [0, 1]})
     return _apply_dark(fig)

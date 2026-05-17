@@ -11,6 +11,29 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_OPERATOR_TOP_KEYS: tuple[str, ...] = (
+    "top_1",
+    "top_2",
+    "top_3",
+    "top_10",
+    "top_p01",
+    "top_p10",
+    "top_p50",
+    "top_p90",
+    "top_p99",
+)
+_OPERATOR_TOP_LABELS: dict[str, str] = {
+    "top_1": "Top-1",
+    "top_2": "Top-2",
+    "top_3": "Top-3",
+    "top_10": "Top-10",
+    "top_p01": "Top-1%",
+    "top_p10": "Top-10%",
+    "top_p50": "Top-50%",
+    "top_p90": "Top-90%",
+    "top_p99": "Top-99%",
+}
+
 
 def _sanitize_filename(value: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value)
@@ -333,6 +356,21 @@ def _plot_outlier_token_feature_3d_per_layer(
         plt.close()
 
 
+def _group_token_layer_trends_by_operator(
+    raw_layer_names: list[str],
+    max_abs: list[list[float]],
+) -> dict[str, list[tuple[int, list[float]]]]:
+    groups: dict[str, list[tuple[int, list[float]]]] = {}
+    for layer_name, row in zip(raw_layer_names, max_abs, strict=False):
+        block, operator = _parse_block_operator(layer_name)
+        if block is None or operator is None:
+            continue
+        groups.setdefault(operator, []).append((block, list(row)))
+    for operator in groups:
+        groups[operator].sort(key=lambda item: item[0])
+    return groups
+
+
 def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     trends = outliers.get("token_layer_trends", None)
     if not isinstance(trends, dict):
@@ -344,94 +382,284 @@ def _plot_token_layer_3d(outliers: dict[str, Any], output_dir: Path) -> None:
     if not tokens or not raw_layer_names or max_abs is None:
         return
 
-    layer_names_pretty = [_pretty_layer_name(n) for n in raw_layer_names]
-
     token_count = len(tokens)
-    layer_count = len(layer_names_pretty)
-    if token_count == 0 or layer_count == 0:
+    if token_count == 0:
         return
-    if len(max_abs) != layer_count or any(len(row) != token_count for row in max_abs):
+    if len(max_abs) != len(raw_layer_names) or any(
+        len(row) != token_count for row in max_abs
+    ):
         return
+
+    groups = _group_token_layer_trends_by_operator(raw_layer_names, max_abs)
+    if not groups:
+        return
+
+    chart_dir = output_dir / "token_layer_maxabs_3d"
+    chart_dir.mkdir(parents=True, exist_ok=True)
 
     max_3d = _chart_3d_token_limit(outliers)
     tokens_plot = tokens
-    max_abs_plot = max_abs
+    token_idx: np.ndarray | None = None
     if token_count > max_3d:
-        idx = np.linspace(0, token_count - 1, max_3d, dtype=int)
-        tokens_plot, _ = _subsample_token_axis(tokens, idx)
-        max_abs_plot = _subsample_cols_list2d(max_abs, idx)
-        token_count = len(tokens_plot)
-
-    mags = np.array(max_abs_plot, dtype=np.float32)  # [L, T]
+        token_idx = np.linspace(0, token_count - 1, max_3d, dtype=int)
+        tokens_plot, _ = _subsample_token_axis(tokens, token_idx)
+    t_plot = len(tokens_plot)
 
     thr = float(outliers.get("threshold", 6.0))
-    keep = np.where((mags >= thr).any(axis=1))[0]
-    if keep.size == 0:
-        keep = np.arange(layer_count)
-    mags = mags[keep, :]
-    layer_names_plot = [layer_names_pretty[int(i)] for i in keep]
-    layer_count = len(layer_names_plot)
 
-    mags_up = _upsample_grid(mags, up_x=6, up_y=2)  # [L_up, T_up]
-    l_up, t_up = mags_up.shape
-
-    xticks = np.linspace(0, t_up - 1, token_count)
-    yticks = np.linspace(0, l_up - 1, layer_count)
-
-    fig = plt.figure(figsize=(max(12, token_count * 0.6), max(7, layer_count * 0.35)))
-    ax = fig.add_subplot(111, projection="3d")
-    X, Y = np.meshgrid(np.arange(t_up), np.arange(l_up))
-    ax.plot_wireframe(
-        X, Y, mags_up, rstride=1, cstride=1, color="royalblue", linewidth=1.5
-    )
-    ax.set_xlabel("Token", labelpad=25)
-    ax.set_ylabel("Layer")
-    ax.set_zlabel("Max |activation| over hidden dims")
-    ax.set_xticks(xticks)
-    ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
-    ax.set_yticks(yticks)
-    ax.set_yticklabels(layer_names_plot)
-    ax.tick_params(axis="x", which="major", pad=-4)
-    ax.tick_params(axis="y", which="major", pad=-5)
-    ax.tick_params(axis="z", which="major", pad=-1)
-    plt.setp(
-        ax.get_xticklabels(),
-        rotation=50,
-        ha="right",
-        va="center",
-        rotation_mode="anchor",
-    )
-    plt.setp(ax.get_yticklabels(), ha="left", rotation_mode="anchor")
-    plt.title("Per-token max activation magnitude across layers")
-    plt.tight_layout()
-    plt.savefig(output_dir / "token_layer_maxabs_3d.png", dpi=200)
-    plt.close()
-
-
-def _plot_layer_channel_hist(layers: dict[str, Any], output_dir: Path) -> None:
-    hist_dir = output_dir / "layer_channel_hist"
-    hist_dir.mkdir(parents=True, exist_ok=True)
-
-    for layer_name, layer_stats in layers.items():
-        means = layer_stats.get("mean", [])
-        if not means:
+    for operator, rows in sorted(groups.items()):
+        if len(rows) < 2:
             continue
 
-        y = np.asarray(means, dtype=np.float32)
-        channel_idx = np.arange(len(means), dtype=np.float32)
+        block_ids = [int(b) for b, _ in rows]
+        layer_rows = [row for _, row in rows]
+        if token_idx is not None:
+            layer_rows = [_subsample_cols_list2d([row], token_idx)[0] for row in layer_rows]
 
-        fig, ax = plt.subplots(figsize=(max(10, len(means) * 0.2), 5))
-        ax.bar(channel_idx, y, width=1.0, color="#44aa99", align="center")
-        ax.set_xlabel("Channel index in layer")
-        ax.set_ylabel("Mean activation")
-        ax.set_title(f"{layer_name}: channel mean activations")
-        ax.grid(True, axis="y", alpha=0.35)
-        fig.tight_layout()
-        fig.savefig(hist_dir / f"{_sanitize_filename(layer_name)}.png", dpi=150)
+        mags = np.asarray(layer_rows, dtype=np.float32)  # [B, T]
+        if mags.ndim != 2 or mags.shape[1] != t_plot:
+            continue
+
+        keep = np.where((mags >= thr).any(axis=1))[0]
+        if keep.size == 0:
+            keep = np.arange(mags.shape[0])
+        mags = mags[keep, :]
+        block_labels = [str(block_ids[int(i)]) for i in keep]
+        block_count = len(block_labels)
+
+        mags_up = _upsample_grid(mags, up_x=6, up_y=2)  # [B_up, T_up]
+        b_up, t_up = mags_up.shape
+
+        xticks = np.linspace(0, t_up - 1, t_plot)
+        yticks = np.linspace(0, b_up - 1, block_count)
+
+        fig = plt.figure(
+            figsize=(max(12, t_plot * 0.6), max(7, block_count * 0.45))
+        )
+        ax = fig.add_subplot(111, projection="3d")
+        X, Y = np.meshgrid(np.arange(t_up), np.arange(b_up))
+        ax.plot_wireframe(
+            X, Y, mags_up, rstride=1, cstride=1, color="royalblue", linewidth=1.5
+        )
+        ax.set_xlabel("Token", labelpad=25)
+        ax.set_ylabel("Transformer block")
+        ax.set_zlabel("Max |activation| over hidden dims")
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(tokens_plot, rotation=50, ha="right")
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(block_labels)
+        ax.tick_params(axis="x", which="major", pad=-4)
+        ax.tick_params(axis="y", which="major", pad=-5)
+        ax.tick_params(axis="z", which="major", pad=-1)
+        plt.setp(
+            ax.get_xticklabels(),
+            rotation=50,
+            ha="right",
+            va="center",
+            rotation_mode="anchor",
+        )
+        plt.setp(ax.get_yticklabels(), ha="left", rotation_mode="anchor")
+        ax.set_title(f"{operator}: per-token max |activation| across blocks")
+        plt.tight_layout()
+        fig.savefig(chart_dir / f"{_sanitize_filename(operator)}.png", dpi=200)
         plt.close(fig)
 
 
-def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
+def _parse_block_operator(layer_name: str) -> tuple[int | None, str | None]:
+    """Return (block_index, operator_suffix) for stacked transformer blocks."""
+    parts = layer_name.split(".")
+    if len(parts) >= 4 and parts[0] == "transformer" and parts[1] == "h":
+        try:
+            block = int(parts[2])
+            operator = ".".join(parts[3:])
+            return (block, operator) if operator else (block, None)
+        except ValueError:
+            pass
+    for i, part in enumerate(parts):
+        if part not in ("h", "layer", "layers"):
+            continue
+        if i + 1 >= len(parts):
+            continue
+        try:
+            block = int(parts[i + 1])
+        except ValueError:
+            continue
+        operator = ".".join(parts[i + 2 :])
+        if operator:
+            return block, operator
+    return None, None
+
+
+def _group_layers_by_operator_metric(
+    layers: dict[str, Any],
+    metric_key: str,
+) -> dict[str, list[tuple[int, float]]]:
+    groups: dict[str, list[tuple[int, float]]] = {}
+    for layer_name, layer_stats in layers.items():
+        if not isinstance(layer_stats, dict):
+            continue
+        val_raw = layer_stats.get(metric_key)
+        if not isinstance(val_raw, (int, float)) or val_raw != val_raw:
+            continue
+        block, operator = _parse_block_operator(layer_name)
+        if block is None or operator is None:
+            continue
+        groups.setdefault(operator, []).append((block, float(val_raw)))
+    for operator in groups:
+        groups[operator].sort(key=lambda row: row[0])
+    return groups
+
+
+def _group_layers_by_operator(
+    layers: dict[str, Any],
+) -> dict[str, list[tuple[int, str, dict[str, float]]]]:
+    """operator -> [(block_idx, layer_name, activation_abs tops), ...]."""
+    groups: dict[str, list[tuple[int, str, dict[str, float]]]] = {}
+    for layer_name, layer_stats in layers.items():
+        if not isinstance(layer_stats, dict):
+            continue
+        tops_raw = layer_stats.get("activation_abs")
+        if not isinstance(tops_raw, dict) or not tops_raw:
+            continue
+        tops: dict[str, float] = {}
+        for key in _OPERATOR_TOP_KEYS:
+            val = tops_raw.get(key)
+            if isinstance(val, (int, float)) and val == val:
+                tops[key] = float(val)
+        if not tops:
+            continue
+        block, operator = _parse_block_operator(layer_name)
+        if block is None or operator is None:
+            continue
+        groups.setdefault(operator, []).append((block, layer_name, tops))
+    for operator in groups:
+        groups[operator].sort(key=lambda row: row[0])
+    return groups
+
+
+def _plot_operator_activation_tops(layers: dict[str, Any], output_dir: Path) -> None:
+    groups = _group_layers_by_operator(layers)
+    if not groups:
+        return
+
+    chart_dir = output_dir / "operator_activation_tops"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+
+    palette = [
+        "#3366cc",
+        "#dc3912",
+        "#ff9900",
+        "#109618",
+        "#990099",
+        "#0099c6",
+        "#dd4477",
+        "#66aa00",
+        "#b82e2e",
+    ]
+
+    for operator, rows in sorted(groups.items()):
+        if len(rows) < 2:
+            continue
+
+        block_ids = [int(r[0]) for r in rows]
+        x = np.arange(len(block_ids), dtype=np.float32)
+
+        fig, ax = plt.subplots(figsize=(max(10, len(block_ids) * 0.55), 5.5))
+        for series_idx, key in enumerate(_OPERATOR_TOP_KEYS):
+            y: list[float] = []
+            for _, _, tops in rows:
+                val = tops.get(key)
+                y.append(float(val) if val is not None else float("nan"))
+            if not any(v == v for v in y):
+                continue
+            color = palette[series_idx % len(palette)]
+            label = _OPERATOR_TOP_LABELS.get(key, key)
+            ax.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=2.0,
+                color=color,
+                label=label,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(b) for b in block_ids])
+        ax.set_xlabel("Transformer block index")
+        ax.set_ylabel("|activation| magnitude")
+        ax.set_title(f"{operator}: |activation| tops across blocks")
+        ax.legend(loc="best", fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.35)
+        fig.tight_layout()
+        fig.savefig(chart_dir / f"{_sanitize_filename(operator)}.png", dpi=150)
+        plt.close(fig)
+
+
+def _plot_operator_metric_aggregated(
+    layers: dict[str, Any],
+    output_dir: Path,
+    *,
+    metric_key: str,
+    title: str,
+    ylabel: str,
+    filename: str,
+) -> None:
+    groups = _group_layers_by_operator_metric(layers, metric_key)
+    if not groups:
+        return
+
+    operators = sorted(
+        op for op, rows in groups.items() if len(rows) >= 2
+    )
+    if not operators:
+        return
+
+    palette = [
+        "#3366cc",
+        "#dc3912",
+        "#ff9900",
+        "#109618",
+        "#990099",
+        "#0099c6",
+        "#dd4477",
+        "#66aa00",
+        "#b82e2e",
+        "#316395",
+        "#994499",
+        "#22aa99",
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(10, max(len(groups[op]) for op in operators) * 0.55), 6))
+    for series_idx, operator in enumerate(operators):
+        rows = groups[operator]
+        block_ids = [int(b) for b, _ in rows]
+        values = [float(v) for _, v in rows]
+        x = np.asarray(block_ids, dtype=np.float32)
+        ax.plot(
+            x,
+            values,
+            marker="o",
+            linewidth=2.0,
+            color=palette[series_idx % len(palette)],
+            label=operator,
+        )
+
+    ax.set_xlabel("Transformer block index")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=150)
+    plt.close(fig)
+
+
+def draw_activation_charts(
+    stats: dict[str, Any],
+    output_dir: str,
+    *,
+    draw_token_trends: bool = False,
+) -> None:
     layers = stats.get("layers", {})
     if not layers:
         return
@@ -451,16 +679,35 @@ def draw_activation_charts(stats: dict[str, Any], output_dir: str) -> None:
             out.mkdir(parents=True, exist_ok=True)
 
             if isinstance(outliers, dict):
-                _plot_token_trends(outliers, out)
+                if draw_token_trends:
+                    _plot_token_trends(outliers, out)
                 _plot_outlier_token_feature_3d(outliers, out)
                 _plot_outlier_token_feature_3d_per_layer(outliers, out)
                 _plot_token_layer_3d(outliers, out)
-            _plot_layer_channel_hist(layers, out)
+            _plot_operator_activation_tops(layers, out)
+            _plot_operator_metric_aggregated(
+                layers,
+                out,
+                metric_key="max_kurtosis",
+                title="Max channel kurtosis across transformer blocks",
+                ylabel="Max kurtosis",
+                filename="operator_max_kurtosis_across_blocks.png",
+            )
+            _plot_operator_metric_aggregated(
+                layers,
+                out,
+                metric_key="max_median_ratio",
+                title="Max-median ratio (MRR) across transformer blocks",
+                ylabel="Max-median ratio",
+                filename="operator_max_median_ratio_across_blocks.png",
+            )
 
 
 def build_charts_from_stats_file(
     stats_path: str | Path,
     output_dir: str | Path | None = None,
+    *,
+    draw_token_trends: bool | None = None,
 ) -> Path:
     stats_file = Path(stats_path).expanduser().resolve()
     if not stats_file.exists():
@@ -473,5 +720,15 @@ def build_charts_from_stats_file(
         if output_dir is not None
         else stats_file.parent
     )
-    draw_activation_charts(stats=stats, output_dir=out_dir.as_posix())
+    if draw_token_trends is None:
+        meta = stats.get("_acta")
+        if isinstance(meta, dict):
+            draw_token_trends = bool(meta.get("draw_token_trends", False))
+        else:
+            draw_token_trends = False
+    draw_activation_charts(
+        stats=stats,
+        output_dir=out_dir.as_posix(),
+        draw_token_trends=draw_token_trends,
+    )
     return out_dir

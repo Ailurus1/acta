@@ -124,6 +124,31 @@ def _summarize_run(run_dir: Path) -> str:
         if tc is not None:
             lines.append(f"Outlier payload token_count: {tc}")
 
+    report = data.get("report")
+    if isinstance(report, dict):
+        mrr = report.get("max_median_ratio")
+        if mrr is not None:
+            lines.append(f"Max median ratio (MRR): {mrr}")
+        kurt = report.get("kurtosis")
+        if kurt is not None:
+            lines.append(f"Kurtosis (|activation|): {kurt}")
+        abs_tops = report.get("activation_abs")
+        if isinstance(abs_tops, dict) and abs_tops:
+            lines.append("Activation |x| tops:")
+            for key in (
+                "top_1",
+                "top_2",
+                "top_3",
+                "top_10",
+                "top_p01",
+                "top_p10",
+                "top_p50",
+                "top_p90",
+                "top_p99",
+            ):
+                if key in abs_tops:
+                    lines.append(f"  {key}: {abs_tops[key]}")
+
     return "\n".join(lines)
 
 
@@ -258,7 +283,16 @@ def clear_cmd() -> None:
     default=None,
     help="Directory for charts (default: directory of stats.json).",
 )
-def plot_cmd(path_to_stats: Path, path_to_charts: Path | None) -> None:
+@click.option(
+    "--draw-token-trends/--no-draw-token-trends",
+    default=None,
+    help="Build per-token trend PNGs (default: from stats metadata, else off).",
+)
+def plot_cmd(
+    path_to_stats: Path,
+    path_to_charts: Path | None,
+    draw_token_trends: bool | None,
+) -> None:
     from acta.visualizer import build_charts_from_stats_file
 
     stats_path = path_to_stats.expanduser().resolve()
@@ -267,7 +301,11 @@ def plot_cmd(path_to_stats: Path, path_to_charts: Path | None) -> None:
         if path_to_charts is not None
         else None
     )
-    output_dir = build_charts_from_stats_file(stats_path, output_dir=out)
+    output_dir = build_charts_from_stats_file(
+        stats_path,
+        output_dir=out,
+        draw_token_trends=draw_token_trends,
+    )
     click.echo(f"Charts written under:\n  {output_dir}")
 
 
